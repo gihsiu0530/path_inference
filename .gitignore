@@ -4,3 +4,7 @@ dataset/
 *.zip
 model/
 *.ckpt
+*.png
+*.jpg
+*.npy
+*.csv
