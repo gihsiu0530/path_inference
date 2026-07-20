@@ -1,8 +1,8 @@
 __pycache__/
-dataset/
 *.zip
 *.ckpt
 *.png
 *.jpg
 *.npy
 *.csv
+*.bag
