@@ -1,0 +1,1 @@
+(stp3_env) cyc@letmesleep:~/ST-P3_experiment$ python park_L2_ASAP.py --checkpoint tensorboard_logs/0624_ASAP/best-box-col-epoch=24-epoch_val_plan_obj_box_col=0.0054.ckpt --dataroot /home/cyc/dataset/0622_fuck/resample/video1

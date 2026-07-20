@@ -1,0 +1,43 @@
+透過seg_real_time.py 語意分割與resize影像 //發布seg_cls4_224
+
+錄資料
+
+在放bag檔資料夾
+dataset/video1/bag檔 
+
+python3 extract_bag_data.py  從bag檔轉資料出來
+python3 resample.py       將資料切成0.5秒的序列存在resample資料夾
+python3 convert_cls4png_to_npy.py --root resample/video1/seg  將語意圖轉為npy檔
+
+
+python infer_depth_da_v2.py   --input_dir ~/senpai/dataset/0624bkgd/resample/video1/img   --out_dir   senpai/dataset/0624bkgd/resample/video1/depth_infer   --ckpt depth_anything_v2_vitl.pth   --device    cuda   --dtype_fp16   --save_vis
+
+相對深度轉換，沒有也行，效果差一點點而已
+
+python park_L2_ASAP.py --checkpoint model/best-box-col-epoch=24-epoch_val_plan_obj_box_col=0.0054.ckpt --dataroot /home/systemlab/senpai/dataset/0624bkgd/resample/video1
+
+
+cyc@letmesleep:~/dataset/0622_fuck$ tree -d
+.
+├── resample
+│   ├── video1
+│   │   ├── depth
+│   │   ├── depth_infer
+│   │   ├── img
+│   │   ├── seg
+│   │   └── vis_png
+│   └── video2
+│       ├── depth
+│       ├── img
+│       └── seg
+├── video1    （還有bag檔）
+│   ├── depth
+│   ├── img
+│   ├── seg
+│   └── vio
+└── video2     （還有bag檔）
+    ├── depth
+    ├── img
+    ├── seg
+    └── vio
+

@@ -1,0 +1,77 @@
+TAG: 'Planning'
+
+GPUS: [0]
+
+BATCHSIZE: 4
+PRECISION: 16
+EPOCHS: 10
+
+GRAD_NORM_CLIP: 5
+
+N_WORKERS: 2
+
+DATASET:
+  VERSION: 'trainval'
+
+TIME_RECEPTIVE_FIELD: 3
+N_FUTURE_FRAMES: 6
+
+
+SEG2D_ROOT: "/home/cyc/dataset/nuscenes/trainval/seg2d"   # 你 precompute .npy 的根目錄
+CLIP_MODEL: "ViT-L-14"                             # open_clip 的型號；沒裝 open_clip 會自動退回簡易 CNN3
+CLIP_INPUT_SIZE: 224
+IPM:
+  MPP: 0.10                                        # 每像素多少公尺（要跟 BEV 大小一致）
+
+
+LIFT:
+  GT_DEPTH: False
+  DEPTH_ROOT: "/home/cyc/dataset/nuscenes/trainval/depths"
+
+MODEL:
+  ENCODER:
+    NAME: 'efficientnet-b4'
+    USE_DEPTH_DISTRIBUTION: False
+  TEMPORAL_MODEL:
+    NAME: 'temporal_block'
+    INPUT_EGOPOSE: True
+  BN_MOMENTUM: 0.05
+
+SEMANTIC_SEG:
+  PEDESTRIAN:
+    ENABLED: False
+  HDMAP:
+    ENABLED: False
+
+INSTANCE_SEG:
+  ENABLED: False
+
+INSTANCE_FLOW:
+  ENABLED: False
+
+PROBABILISTIC:
+  ENABLED: False
+  METHOD: 'GAUSSIAN'
+
+PLANNING:
+  ENABLED: True
+  SAMPLE_NUM: 30
+
+FUTURE_DISCOUNT: 0.95
+
+OPTIMIZER:
+  # LR: 2e-4
+  # CLIP_LR: 2e-5
+  LR: 2e-4
+  CLIP_LR: 2e-5
+
+COST_FUNCTION:
+  SAFETY: 1.
+  HEADWAY: 1.
+  LRDIVIDER: 10.
+  COMFORT: 0.1
+  PROGRESS: 0.5
+  VOLUME: 100.
+
+PRETRAINED:
+   LOAD_WEIGHTS: False
