@@ -1,8 +1,6 @@
 __pycache__/
-checkpoint/
 dataset/
 *.zip
-model/
 *.ckpt
 *.png
 *.jpg
