@@ -87,6 +87,18 @@ Visualization Manager:
         cached_waypoint_marker: true
       Queue Size: 100
       Value: true
+    - Class: rviz/Image
+      Enabled: true
+      Image Topic: /zed2i/zed_node/right_raw/image_raw_color
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
+      Name: Camera
+      Normalize Range: true
+      Queue Size: 2
+      Transport Hint: raw
+      Unreliable: false
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
