@@ -64,10 +64,24 @@ source /opt/ros/noetic/setup.bash
 | 訂閱 | `~in_topic` | `/zed2i/zed_node/right_raw/image_raw_color` | `sensor_msgs/Image` |
 | 訂閱 | `~odom_topic` | `/odom` | `nav_msgs/Odometry` |
 | 訂閱 | `~command_topic` | `/senpai/command` | `std_msgs/String` |
-| 發布 | `~path_topic` | `/senpai/path` | `nav_msgs/Path` |
+| 發布 | `~path_topic` | `/senpai/path` | `nav_msgs/Path`（base_link 局部座標） |
+| 發布 | `~path_global_topic` | `/senpai/path_global` | `nav_msgs/Path`（odom 全域座標） |
 | 發布 | `~seg_topic` | `/senpai/seg_cls4_224` | `sensor_msgs/Image`（除錯用） |
 
-其他參數：`~checkpoint`、`~frame_id`（預設 `base_link`）、`~sample_interval`（預設 `0.5`）、`~device`、`~use_fp16`。
+其他參數：`~checkpoint`、`~frame_id`（預設 `base_link`）、`~sample_interval`（預設 `0.5`）、`~device`、`~use_fp16`、`~save_plots`（預設 `false`）。
+
+### 推論可視化圖（`~save_plots`）
+
+設 `_save_plots:=true` 時，每次推論會存一張**離線同風格的 combo 圖**到
+`realtime/inference/<MM_DD_HH_MM_SS>/inference_plots/`（每次跑一個新時間戳資料夾）：
+左邊 224×224 相機影像、右邊軌跡面板（🟢 過去 input + 🔴 預測）。即時推論**沒有未來 GT**，
+所以不會有藍色 GT 軌跡、也沒有 L2 數字，其餘與 `inference/imgs/…/inference_plots` 一致。
+
+```bash
+python3 realtime/realtime_planner_node.py _save_plots:=true
+```
+
+預設（不帶此參數）不產生任何檔案。
 
 ### command（必要，且無法自動取得）
 
@@ -97,8 +111,17 @@ rostopic pub /senpai/command std_msgs/String "data: 'LEFT'" -r 1
 
 ### 輸出格式
 
-`nav_msgs/Path`，`frame_id=base_link`，共 **7 個點**（起點 `(0,0,0)` + 未來 6 點），間隔 0.5 秒。
-座標遵循 ROS REP-103（x 前、y 左）—— 模型內部用的是 `(x_left, y_front)`，節點已轉換回來。
+同時發**兩個** `nav_msgs/Path`，各 **7 個點**（起點 + 未來 6 點），間隔 0.5 秒：
+
+- **`/senpai/path`（`frame_id=base_link`，局部座標）**：起點固定為 `(0,0,0)`，
+  座標遵循 ROS REP-103（x 前、y 左）—— 模型內部用的是 `(x_left, y_front)`，節點已轉換回來。
+- **`/senpai/path_global`（全域座標）**：把同一組軌跡用**當前 `/odom` 姿態**
+  （位置 + 朝向）轉到全域 —— 起點即 `/odom` 當前 `(x, y)`、朝向為機器人當前 heading，
+  未來 6 點沿此姿態延伸，每點的 quaternion 為「機器人 yaw + 模型相對 yaw」（全域 heading）。
+  `frame_id` **直接沿用 `/odom` 訊息的 `header.frame_id`**（取不到才 fallback `odom`）；
+  例如 `dataset/0624bkgd` 的 bag 其 `/odom` frame 是 `map`，故此 topic 也會是 `map`。
+
+兩者並存、內容一一對應；base_link 版行為不變，`visualize.py` 也仍讀 base_link 版自行轉全域。
 
 ---
 
@@ -126,11 +149,16 @@ rosbag play dataset/0624bkgd/video1/2026-06-23-18-23-14.bag
 ### 檢查
 
 ```bash
-rostopic hz /senpai/path      # 約 2 Hz（0.5 秒節拍）
-rostopic echo -n1 /senpai/path
+rostopic hz /senpai/path             # 約 2 Hz（0.5 秒節拍）
+rostopic echo -n1 /senpai/path       # base_link 局部，起點 (0,0,0)
+rostopic echo -n1 /senpai/path_global  # odom 全域，起點 = 當前 /odom (x,y)
 ```
 
-RViz（可選）：Fixed Frame 設 `base_link`，加一個 Path display 指向 `/senpai/path`。
+RViz（可選）：
+- 看**局部路徑**：Fixed Frame 設 `base_link`，Path display 指向 `/senpai/path`。
+- 看**全域路徑**：Fixed Frame 設成 `/odom` 的 frame（`dataset/0624bkgd` 的 bag 是 `map`；
+  用 `rostopic echo -n1 /senpai/path_global` 看 `frame_id` 確認），Path display 指向
+  `/senpai/path_global`（起點會貼著機器人當前位置、沿朝向延伸）。
 
 ---
 
@@ -176,7 +204,35 @@ python3 realtime/visualize.py
 
 ---
 
-## 7. 設計說明（維護時必讀）
+## 7. 在 RViz 看全域路徑 [senpai_rviz.launch](senpai_rviz.launch)
+
+一鍵起 RViz 並預載設定，即時看 `/senpai/path_global`（全域 odom 座標的預測路徑）：
+
+```bash
+source /opt/ros/noetic/setup.bash
+python3 realtime/realtime_planner_node.py       # 終端 1（會發 /senpai/path_global）
+roslaunch realtime/senpai_rviz.launch           # 終端 2（起 static TF + RViz）
+rosbag play dataset/0624bkgd/video1/2026-06-23-18-23-14.bag   # 終端 3
+```
+
+橘色路徑會隨每次推論更新（約 2 Hz），起點貼著機器人當前 map 位置、沿朝向延伸。
+
+> ⚠️ **為何要 launch 而不是直接開 RViz**：此 bag **沒有任何 `/tf`**，而 RViz 的
+> Fixed Frame 必須存在於 TF 樹中。直接把 Fixed Frame 設成 `map` 會報
+> 「Fixed Frame [map] does not exist」而畫不出東西。launch 裡用一個
+> `static_transform_publisher`（`map → map_root`）讓 `map` frame「存在」，
+> 路徑仍以自身絕對 map 座標渲染，不受此靜態變換數值影響。
+
+**換資料集**：`/senpai/path_global` 的 frame 是沿用 `/odom` 的 `header.frame_id`（此 bag 為
+`map`）。若別的資料集 `/odom` frame 是 `odom`，用 `roslaunch realtime/senpai_rviz.launch frame:=odom`
+並把 [senpai_path.rviz](senpai_path.rviz) 的 `Fixed Frame` 一併改成 `odom`。
+
+**看不到路徑？** 多半是視角沒對到路徑座標（此 bag 路徑約在 `(37,-8) → (57,-17)`）。
+用滑鼠拖曳平移、滾輪縮放即可；或調整 Views 面板的 `X`/`Y`（Focal Point）到該處。
+
+---
+
+## 8. 設計說明（維護時必讀）
 
 ### 0.5 秒節拍是硬性假設
 

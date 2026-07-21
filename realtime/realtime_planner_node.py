@@ -21,6 +21,8 @@ SEG_PALETTE and the coordinate swap below.
 import os
 import sys
 import time
+import pathlib
+import datetime
 from collections import deque
 
 # Must be set before park_L2_ASAP pulls in matplotlib.pyplot (headless node).
@@ -57,6 +59,8 @@ from park_L2_ASAP import (
     _call_model_forward,
     _call_model_planning,
     _prepare_l2_labels,
+    save_inference_plot,
+    _input_history_from_egomotion,
 )
 from stp3.utils.geometry import mat2pose_vec
 
@@ -225,6 +229,8 @@ class RealtimePlannerNode:
         self.odom_topic = rospy.get_param("~odom_topic", "/odom")
         self.command_topic = rospy.get_param("~command_topic", "/senpai/command")
         self.path_topic = rospy.get_param("~path_topic", "/senpai/path")
+        self.path_global_topic = rospy.get_param(
+            "~path_global_topic", "/senpai/path_global")
         self.seg_topic = rospy.get_param("~seg_topic", "/senpai/seg_cls4_224")
         self.frame_id = rospy.get_param("~frame_id", "base_link")
         self.checkpoint = rospy.get_param("~checkpoint", DEFAULT_CHECKPOINT)
@@ -235,6 +241,9 @@ class RealtimePlannerNode:
         # Swapping LEFT<->RIGHT before the model makes the /senpai/command topic
         # match physical intent. Set false to feed the raw label through.
         self.flip_command = bool(rospy.get_param("~flip_command", True))
+        # Save an offline-style inference plot (camera image + trajectory panel)
+        # per inference cycle. Off by default so normal runs stay lightweight.
+        self.save_plots = bool(rospy.get_param("~save_plots", False))
 
         default_device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = rospy.get_param("~device", default_device)
@@ -277,8 +286,13 @@ class RealtimePlannerNode:
         self.last_odom = None
         self.last_sample_time = None
         self._busy = False
+        # Lazily created on the first saved plot (avoids leaving an empty dir).
+        self._plot_dir = None
+        self._plot_seq = 0
 
         self.pub_path = rospy.Publisher(self.path_topic, Path, queue_size=1)
+        self.pub_path_global = rospy.Publisher(
+            self.path_global_topic, Path, queue_size=1)
         self.pub_seg = rospy.Publisher(self.seg_topic, RosImage, queue_size=1)
 
         self.sub_odom = rospy.Subscriber(
@@ -292,8 +306,12 @@ class RealtimePlannerNode:
         rospy.loginfo(f"[planner] subscribe odom    {self.odom_topic}")
         rospy.loginfo(f"[planner] subscribe command {self.command_topic}")
         rospy.loginfo(f"[planner] publish   path    {self.path_topic} ({self.frame_id})")
+        rospy.loginfo(f"[planner] publish   path    {self.path_global_topic} (odom, global)")
         rospy.loginfo(f"[planner] flip_command={self.flip_command} "
                       f"(LEFT/RIGHT swapped before the model)")
+        if self.save_plots:
+            rospy.loginfo("[planner] save_plots=true: inference plots -> "
+                          "realtime/inference/<ts>/inference_plots/")
 
     # ---------- callbacks ----------
 
@@ -366,6 +384,11 @@ class RealtimePlannerNode:
         t_plan = time.perf_counter()
 
         self.pub_path.publish(self.build_path(final_traj, msg.header.stamp))
+        self.pub_path_global.publish(
+            self.build_path_global(final_traj, msg.header.stamp, self.last_odom))
+
+        if self.save_plots:
+            self.save_plot(final_traj, msg.header.stamp)
 
         rospy.loginfo_throttle(
             1.0,
@@ -462,6 +485,92 @@ class RealtimePlannerNode:
             pose.pose.orientation.w = float(np.cos(yaw / 2.0))
             path.poses.append(pose)
         return path
+
+    def build_path_global(self, traj: np.ndarray, stamp, odom_msg: Odometry) -> Path:
+        """
+        Same trajectory as build_path, but expressed in the global odom frame:
+        the start point sits at the robot's current /odom (x, y) and the future
+        points are rotated/translated by the current pose. The xy swap back to
+        base_link (x forward, y left) matches build_path; the global rotation
+        mirrors visualize.py:40-46 (base_link_to_global).
+        """
+        p = odom_msg.pose.pose.position
+        o = odom_msg.pose.pose.orientation
+        rx, ry = float(p.x), float(p.y)
+        ryaw = quaternion_yaw(Quaternion(o.w, o.x, o.y, o.z))
+        cos_r, sin_r = np.cos(ryaw), np.sin(ryaw)
+
+        path = Path()
+        path.header.stamp = stamp
+        path.header.frame_id = odom_msg.header.frame_id or "odom"
+
+        points = np.vstack([np.zeros((1, 3), dtype=np.float32), traj])  # prepend t0
+        for i, (x_left, y_front, yaw) in enumerate(points):
+            x_forward, y_left = y_front, x_left  # model (x_left, y_front) -> base_link
+            gx = rx + cos_r * x_forward - sin_r * y_left
+            gy = ry + sin_r * x_forward + cos_r * y_left
+            gyaw = ryaw + yaw
+
+            pose = PoseStamped()
+            pose.header.frame_id = path.header.frame_id
+            pose.header.stamp = stamp + rospy.Duration(i * self.sample_interval)
+            pose.pose.position.x = float(gx)
+            pose.pose.position.y = float(gy)
+            pose.pose.position.z = 0.0
+            pose.pose.orientation.z = float(np.sin(gyaw / 2.0))
+            pose.pose.orientation.w = float(np.cos(gyaw / 2.0))
+            path.poses.append(pose)
+        return path
+
+    def _ensure_plot_dir(self) -> pathlib.Path:
+        """
+        realtime/inference/<MM_DD_HH_MM_SS>/inference_plots — mirrors the offline
+        park_L2_ASAP.mk_save_dir layout, rooted under realtime/ instead. Created
+        once, on the first saved plot.
+        """
+        if self._plot_dir is None:
+            now = datetime.datetime.now()
+            stamp = "_".join("%02d" % v for v in
+                             (now.month, now.day, now.hour, now.minute, now.second))
+            self._plot_dir = (pathlib.Path(_REPO_ROOT) / "realtime" / "inference"
+                              / stamp / "inference_plots")
+            self._plot_dir.mkdir(parents=True, exist_ok=True)
+            rospy.loginfo(f"[planner] saving inference plots -> {self._plot_dir}")
+        return self._plot_dir
+
+    def save_plot(self, final_traj: np.ndarray, stamp) -> None:
+        """
+        Offline-style combo plot (camera image + trajectory panel), reusing
+        park_L2_ASAP.save_inference_plot. Realtime has no future GT, so gt/l2 are
+        empty (the panel then omits the blue GT track and the L2 text). The pred x
+        sign is flipped exactly like the offline path (park_L2_ASAP.py:718) so the
+        panel orientation matches; this copy never touches the published paths.
+        """
+        rgb_224 = self.buffer.rgb[-1]
+
+        pred = np.asarray(final_traj, dtype=np.float64).copy()
+        if pred.shape[1] == 2:
+            pred = np.concatenate([pred, np.zeros((pred.shape[0], 1))], axis=1)
+        pred[:, 0] *= -1.0
+
+        fego = torch.from_numpy(self.buffer.build_future_egomotion()).float()
+        input_xy, input_yaw = _input_history_from_egomotion(fego)
+
+        gt = np.zeros((0, 3), dtype=np.float32)
+        l2 = np.zeros((0,), dtype=np.float32)
+
+        save_inference_plot(
+            rgb_224=rgb_224,
+            pred=pred,
+            gt=gt,
+            l2=l2,
+            t_ref=stamp.to_nsec(),
+            seq_idx=self._plot_seq,
+            out_dir=self._ensure_plot_dir(),
+            input_xy=input_xy,
+            input_yaw=input_yaw,
+        )
+        self._plot_seq += 1
 
 
 def main():

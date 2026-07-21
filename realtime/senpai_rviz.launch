@@ -1,0 +1,14 @@
+<launch>
+  <!-- 換資料集若 /odom 的 frame_id 不是 map，改這裡（並同步改 senpai_path.rviz 的 Fixed Frame） -->
+  <arg name="frame" default="map"/>
+
+  <!-- 此 bag 沒有任何 /tf：發一個 static transform 讓 Fixed Frame 存在於 TF 樹，
+       否則 RViz 會報「Fixed Frame [map] does not exist」。路徑用自身絕對 map 座標
+       渲染，不受此靜態變換的數值影響（它只負責讓該 frame「存在」）。 -->
+  <node pkg="tf2_ros" type="static_transform_publisher" name="map_anchor"
+        args="0 0 0 0 0 0 $(arg frame) map_root"/>
+
+  <!-- $(dirname) 讓 launch 不必包成 catkin package 也能找到同目錄的 .rviz -->
+  <node pkg="rviz" type="rviz" name="rviz"
+        args="-d $(dirname)/senpai_path.rviz"/>
+</launch>
