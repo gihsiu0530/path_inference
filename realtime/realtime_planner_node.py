@@ -344,6 +344,10 @@ class RealtimePlannerNode:
                           f"{self.last_sample_time - now:.1f}s; resetting history")
             self.buffer = RealtimeSequenceBuffer()
             self.last_sample_time = None
+            # Treat a clock restart as a new run: start a fresh plot folder so
+            # each bag replay lands in its own realtime/inference/<ts>/ dir.
+            self._plot_dir = None
+            self._plot_seq = 0
 
         # Enforce the model's 0.5 s cadence; everything else is dropped before
         # the segmentation runs.

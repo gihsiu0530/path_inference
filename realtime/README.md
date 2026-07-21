@@ -73,7 +73,7 @@ source /opt/ros/noetic/setup.bash
 ### 推論可視化圖（`~save_plots`）
 
 設 `_save_plots:=true` 時，每次推論會存一張**離線同風格的 combo 圖**到
-`realtime/inference/<MM_DD_HH_MM_SS>/inference_plots/`（每次跑一個新時間戳資料夾）：
+`realtime/inference/<MM_DD_HH_MM_SS>/inference_plots/`：
 左邊 224×224 相機影像、右邊軌跡面板（🟢 過去 input + 🔴 預測）。即時推論**沒有未來 GT**，
 所以不會有藍色 GT 軌跡、也沒有 L2 數字，其餘與 `inference/imgs/…/inference_plots` 一致。
 
@@ -81,7 +81,9 @@ source /opt/ros/noetic/setup.bash
 python3 realtime/realtime_planner_node.py _save_plots:=true
 ```
 
-預設（不帶此參數）不產生任何檔案。
+**資料夾切換時機**：節點在**第一次推論**時建立第一個時間戳資料夾；之後**每次重播 bag**
+（偵測到時間倒退＝時鐘重啟）會自動**開一個新的時間戳資料夾**，不需重啟節點。同一段連續
+播放的所有圖都存在同一個資料夾。預設（不帶此參數）不產生任何檔案。
 
 ### command（必要，且無法自動取得）
 
