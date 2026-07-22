@@ -40,7 +40,7 @@ import rospy
 from sensor_msgs.msg import Image as RosImage
 from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import PoseStamped
-from std_msgs.msg import String
+from std_msgs.msg import String, Float64MultiArray
 
 import torch.nn.functional as F
 from transformers import SegformerImageProcessor, SegformerForSemanticSegmentation
@@ -225,12 +225,16 @@ class RealtimeSequenceBuffer:
 class RealtimePlannerNode:
     def __init__(self):
         self.in_topic = rospy.get_param(
-            "~in_topic", "/zed2i/zed_node/right_raw/image_raw_color")
+            "~in_topic", "/zed2i/zed_node/rgb_raw/image_raw_color")
         self.odom_topic = rospy.get_param("~odom_topic", "/odom")
         self.command_topic = rospy.get_param("~command_topic", "/senpai/command")
         self.path_topic = rospy.get_param("~path_topic", "/senpai/path")
         self.path_global_topic = rospy.get_param(
             "~path_global_topic", "/senpai/path_global")
+        # Same global trajectory as path_global, but flattened to [x0,y0,x1,y1,...]
+        # as std_msgs/Float64MultiArray so the MPC chain (local_path -> mpc) can
+        # consume it unchanged in place of global_path's CSV route (array_topic).
+        self.array_topic = rospy.get_param("~array_topic", "array_topic")
         self.seg_topic = rospy.get_param("~seg_topic", "/senpai/seg_cls4_224")
         self.frame_id = rospy.get_param("~frame_id", "base_link")
         self.checkpoint = rospy.get_param("~checkpoint", DEFAULT_CHECKPOINT)
@@ -293,6 +297,8 @@ class RealtimePlannerNode:
         self.pub_path = rospy.Publisher(self.path_topic, Path, queue_size=1)
         self.pub_path_global = rospy.Publisher(
             self.path_global_topic, Path, queue_size=1)
+        self.pub_array = rospy.Publisher(
+            self.array_topic, Float64MultiArray, queue_size=1)
         self.pub_seg = rospy.Publisher(self.seg_topic, RosImage, queue_size=1)
 
         self.sub_odom = rospy.Subscriber(
@@ -307,6 +313,7 @@ class RealtimePlannerNode:
         rospy.loginfo(f"[planner] subscribe command {self.command_topic}")
         rospy.loginfo(f"[planner] publish   path    {self.path_topic} ({self.frame_id})")
         rospy.loginfo(f"[planner] publish   path    {self.path_global_topic} (odom, global)")
+        rospy.loginfo(f"[planner] publish   array   {self.array_topic} (Float64MultiArray, for MPC)")
         rospy.loginfo(f"[planner] flip_command={self.flip_command} "
                       f"(LEFT/RIGHT swapped before the model)")
         if self.save_plots:
@@ -386,6 +393,8 @@ class RealtimePlannerNode:
         self.pub_path.publish(self.build_path(final_traj, msg.header.stamp))
         self.pub_path_global.publish(
             self.build_path_global(final_traj, msg.header.stamp, self.last_odom))
+        self.pub_array.publish(
+            self.build_array_topic(final_traj, self.last_odom))
 
         if self.save_plots:
             self.save_plot(final_traj, msg.header.stamp)
@@ -486,13 +495,14 @@ class RealtimePlannerNode:
             path.poses.append(pose)
         return path
 
-    def build_path_global(self, traj: np.ndarray, stamp, odom_msg: Odometry) -> Path:
+    def _global_points(self, traj: np.ndarray, odom_msg: Odometry) -> np.ndarray:
         """
-        Same trajectory as build_path, but expressed in the global odom frame:
-        the start point sits at the robot's current /odom (x, y) and the future
-        points are rotated/translated by the current pose. The xy swap back to
-        base_link (x forward, y left) matches build_path; the global rotation
-        mirrors visualize.py:40-46 (base_link_to_global).
+        The trajectory (t0 start + 6 future points) expressed in the global odom
+        frame, as (7, 3) rows of (gx, gy, gyaw). The start point sits at the
+        robot's current /odom (x, y); future points are rotated/translated by the
+        current pose. The xy swap back to base_link (x forward, y left) matches
+        build_path; the global rotation mirrors visualize.py:40-46
+        (base_link_to_global). Shared by build_path_global and build_array_topic.
         """
         p = odom_msg.pose.pose.position
         o = odom_msg.pose.pose.orientation
@@ -500,17 +510,27 @@ class RealtimePlannerNode:
         ryaw = quaternion_yaw(Quaternion(o.w, o.x, o.y, o.z))
         cos_r, sin_r = np.cos(ryaw), np.sin(ryaw)
 
+        points = np.vstack([np.zeros((1, 3), dtype=np.float32), traj])  # prepend t0
+        out = np.empty((points.shape[0], 3), dtype=np.float64)
+        for i, (x_left, y_front, yaw) in enumerate(points):
+            x_forward, y_left = y_front, x_left  # model (x_left, y_front) -> base_link
+            out[i, 0] = rx + cos_r * x_forward - sin_r * y_left
+            out[i, 1] = ry + sin_r * x_forward + cos_r * y_left
+            out[i, 2] = ryaw + yaw
+        return out
+
+    def build_path_global(self, traj: np.ndarray, stamp, odom_msg: Odometry) -> Path:
+        """
+        Same trajectory as build_path, but expressed in the global odom frame
+        (see _global_points). frame_id follows the /odom message frame.
+        """
+        gpts = self._global_points(traj, odom_msg)
+
         path = Path()
         path.header.stamp = stamp
         path.header.frame_id = odom_msg.header.frame_id or "odom"
 
-        points = np.vstack([np.zeros((1, 3), dtype=np.float32), traj])  # prepend t0
-        for i, (x_left, y_front, yaw) in enumerate(points):
-            x_forward, y_left = y_front, x_left  # model (x_left, y_front) -> base_link
-            gx = rx + cos_r * x_forward - sin_r * y_left
-            gy = ry + sin_r * x_forward + cos_r * y_left
-            gyaw = ryaw + yaw
-
+        for i, (gx, gy, gyaw) in enumerate(gpts):
             pose = PoseStamped()
             pose.header.frame_id = path.header.frame_id
             pose.header.stamp = stamp + rospy.Duration(i * self.sample_interval)
@@ -521,6 +541,19 @@ class RealtimePlannerNode:
             pose.pose.orientation.w = float(np.cos(gyaw / 2.0))
             path.poses.append(pose)
         return path
+
+    def build_array_topic(self, traj: np.ndarray, odom_msg: Odometry) -> Float64MultiArray:
+        """
+        The same global-frame points as build_path_global, flattened to
+        [x0, y0, x1, y1, ...] (7 points = 14 values) as std_msgs/Float64MultiArray.
+        This is the exact layout local_path.cpp::callbackorgwp expects on
+        array_topic, so the MPC chain consumes the inferred path in place of
+        global_path's CSV route without any controller-side change.
+        """
+        gpts = self._global_points(traj, odom_msg)
+        msg = Float64MultiArray()
+        msg.data = gpts[:, :2].reshape(-1).tolist()  # [x0,y0,x1,y1,...]
+        return msg
 
     def _ensure_plot_dir(self) -> pathlib.Path:
         """

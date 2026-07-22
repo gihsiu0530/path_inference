@@ -20,16 +20,22 @@
 
 ## 1. 執行環境
 
-**只用 ROS noetic 的 `python3`（3.8）**：
+**先 source noetic，再用 conda `stp3_ros`**：
 
 ```bash
 source /opt/ros/noetic/setup.bash
+conda activate stp3_ros
 ```
 
-此環境已同時具備 `rospy`、`torch 2.4.1+cu121`、`transformers`、`pytorch_lightning`、`pandas`、`pyquaternion`，CUDA 可用。
+`stp3_ros` 已同時具備 `rospy`、`cv_bridge`、`torch 2.2.2+cu121`、`transformers`、`pytorch_lightning`、
+`pandas`、`pyquaternion`、`fvcore`、`yacs`，CUDA 可用；實測可完整跑起本節點。
 
-> ⚠️ **不要用 `stp3_env`**：該環境沒有 `rospy`，也沒有 `transformers`，無法執行本節點。
-> 離線流程的 Step 4 才需要 `stp3_env`；即時流程完全不需要。
+> ⚠️ **不要用系統的 noetic `python3`**：它缺 `pyquaternion`、`pytorch_lightning`、`fvcore`，
+> 節點在 import 階段就會 `ModuleNotFoundError`。
+> `source /opt/ros/noetic/setup.bash` 仍然必要（提供 ROS 環境變數與 `rosbag`/`roscore`），
+> 但實際執行請用 `stp3_ros` 的直譯器。
+
+> ⚠️ **不要用 `stp3_env`**：該環境沒有 `rospy`，無法執行本節點；它是另一台機器的離線環境定義。
 
 ---
 
@@ -52,7 +58,7 @@ source /opt/ros/noetic/setup.bash
 > 若硬改 `strict=False`，`vlm` 會維持隨機初始化 → 輸出的是雜訊路徑。
 >
 > **但此檔不要刪**：完整模型建構時會把它當作**凍結的 AD-MLP coarse baseline** 載入
-> （`codex_pure_ASAP.py:16` 寫死絕對路徑 `/home/systemlab/senpai/checkpoint/last.ckpt`），
+> （`codex_pure_ASAP.py:15-18` 的 `DEFAULT_ADMLP_BASELINE_CKPT`，以 repo 根目錄組出 `checkpoint/last.ckpt`），
 > 它的 6 個 `plan_head` 張量正好對應完整模型的 `model.admlp_baseline.*`。缺檔會導致完整模型無法建構。
 
 ---
@@ -61,14 +67,28 @@ source /opt/ros/noetic/setup.bash
 
 | 方向 | 參數 | 預設 Topic | 型別 |
 |---|---|---|---|
-| 訂閱 | `~in_topic` | `/zed2i/zed_node/right_raw/image_raw_color` | `sensor_msgs/Image` |
+| 訂閱 | `~in_topic` | `/zed2i/zed_node/rgb_raw/image_raw_color` | `sensor_msgs/Image` |
 | 訂閱 | `~odom_topic` | `/odom` | `nav_msgs/Odometry` |
 | 訂閱 | `~command_topic` | `/senpai/command` | `std_msgs/String` |
 | 發布 | `~path_topic` | `/senpai/path` | `nav_msgs/Path`（base_link 局部座標） |
 | 發布 | `~path_global_topic` | `/senpai/path_global` | `nav_msgs/Path`（odom 全域座標） |
+| 發布 | `~array_topic` | `array_topic` | `std_msgs/Float64MultiArray`（給 MPC 控制器） |
 | 發布 | `~seg_topic` | `/senpai/seg_cls4_224` | `sensor_msgs/Image`（除錯用） |
 
 其他參數：`~checkpoint`、`~frame_id`（預設 `base_link`）、`~sample_interval`（預設 `0.5`）、`~device`、`~use_fp16`、`~save_plots`（預設 `false`）。
+
+### 給 MPC 控制器的 `array_topic`
+
+`~array_topic`（預設 `array_topic`）發的是**與 `/senpai/path_global` 同一組全域點**，
+只是攤平成 `std_msgs/Float64MultiArray`，內容為 `[x0,y0,x1,y1,...]`（起點 + 未來 6 點，共 7 點 = 14 個值）。
+這正是 `mpc_4state/local_path.cpp::callbackorgwp` 期望的格式，因此 MPC 控制鏈
+（`local_path` → `mpc`）可**零修改**直接吃即時推論路徑，取代原本 `global_path` 讀 CSV 的全域路線。
+每次推論（約 2 Hz）整包覆蓋前一次（rolling）。
+
+> ⚠️ **不要同時啟動 `global_path`**：它也發 `array_topic`，兩者會互相蓋掉。用即時路徑時只跑本節點。
+>
+> ⚠️ **座標系一致性**：`array_topic` 的座標沿用 `~odom_topic` 訊息的 frame（此 bag 為 `map`）。
+> 必須確保 **本節點與控制器 `local_path` 吃的是同一個 `/odom` 定位來源**，最近點搜尋才會對齊。
 
 ### 推論可視化圖（`~save_plots`）
 
@@ -125,7 +145,7 @@ rostopic pub /senpai/command std_msgs/String "data: 'LEFT'" -r 1
 
 ---
 
-## 4. 啟動（每個終端都要先 `source /opt/ros/noetic/setup.bash`）
+## 4. 啟動（每個終端都要先 `source /opt/ros/noetic/setup.bash && conda activate stp3_ros`）
 
 ```bash
 # 終端 1
@@ -167,7 +187,7 @@ RViz（可選）：
 在**自己的終端**執行（需要真正的 TTY），把按鍵即時發到 `/senpai/command`：
 
 ```bash
-source /opt/ros/noetic/setup.bash
+source /opt/ros/noetic/setup.bash && conda activate stp3_ros
 python3 realtime/keyboard_command.py
 ```
 
@@ -193,7 +213,7 @@ python3 realtime/keyboard_command.py
 - 左上角文字：`x` / `y` / `yaw` / `cmd`
 
 ```bash
-source /opt/ros/noetic/setup.bash
+source /opt/ros/noetic/setup.bash && conda activate stp3_ros
 python3 realtime/visualize.py
 ```
 
