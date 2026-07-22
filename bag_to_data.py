@@ -163,7 +163,7 @@ def parse_args():
     parser.add_argument("--end", type=int, default=9, help="結束 video 編號。")
     parser.add_argument(
         "--rgb-topic",
-        default="/zed2i/zed_node/right_raw/image_raw_color",
+        default="/zed2i/zed_node/rgb_raw/image_raw_color",
         help="原始 RGB 影像 topic。",
     )
     parser.add_argument("--odom-topic", default="/odom", help="里程計 topic。")

@@ -12,9 +12,10 @@ from stp3.utils.geometry import calculate_birds_eye_view_parameters
 from stp3.utils.tools import gen_dx_bx
 
 
-DEFAULT_ADMLP_BASELINE_CKPT = (
-    "/home/systemlab/senpai/checkpoint/last.ckpt"
-)
+# 以本檔案位置回推專案根目錄，讓 AD-MLP baseline 權重不綁定特定機器的絕對路徑。
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+DEFAULT_ADMLP_BASELINE_CKPT = os.path.join(_REPO_ROOT, "checkpoint", "last.ckpt")
 
 # ASAP 急轉軌跡約束總開關：
 # True  = 驗證/推論時啟用 SharpTurnLateralAccelerationLimiter

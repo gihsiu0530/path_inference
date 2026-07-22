@@ -41,16 +41,16 @@ source /opt/ros/noetic/setup.bash
 - Step 2（`resample.py`，純標準函式庫）與 Step 3（`convert_cls4png_to_npy.py`，需 `numpy` + `PIL`）
   也可在此環境執行。
 
-### 1.2 推論環境（Step 4）：conda `stp3_env`
+### 1.2 推論環境（Step 4）：conda `stp3_ros`
 
 ```bash
-conda env create -f environment.yml   # 首次建立
-conda activate stp3_env               # 每次使用前啟用
+conda activate stp3_ros               # 每次使用前啟用
 ```
 
-- Python 3.9.23 / PyTorch / torchvision / transformers / opencv / pandas / pytorch-lightning（詳見 [environment.yml](environment.yml)）。
-- **推論步驟務必在 `stp3_env` 內執行，勿用系統 python。**
-- 此環境與 1.1 的 noetic 環境不同（py3.9 vs py3.8，無法互相 import `rosbag`），請分開使用。
+- PyTorch 2.2.2+cu121 / torchvision / transformers / opencv / pandas / pytorch-lightning / yacs / fvcore 均已具備，實測可完成 Step 4 推論。
+- **推論步驟務必在 `stp3_ros` 內執行，勿用系統 python。**
+- [environment.yml](environment.yml) 是另一台機器上 `stp3_env`（py3.9）的環境定義，本機不使用；
+  其 `prefix:` 指向不存在的 `/home/cyc/miniconda3`，若要據此另建環境請先移除該行。
 
 ---
 
@@ -60,11 +60,11 @@ conda activate stp3_env               # 每次使用前啟用
 
 | 用途 | Topic 名稱 | 說明 / 參數 |
 |---|---|---|
-| 相機 RGB 輸入 | `/zed2i/zed_node/right_raw/image_raw_color` | `bag_to_data.py` 的 `--rgb-topic` 預設值；亦為 `seg_real_time.py` 的預設訂閱 topic（[seg_real_time.py:216](seg_real_time.py#L216)） |
+| 相機 RGB 輸入 | `/zed2i/zed_node/rgb_raw/image_raw_color` | `bag_to_data.py` 的 `--rgb-topic` 預設值；亦為 `seg_real_time.py` 的預設訂閱 topic（[seg_real_time.py:216](seg_real_time.py#L216)） |
 | 里程計 | `/odom` | `bag_to_data.py` 的 `--odom-topic` 預設值（[extract_bag_data.py:16](extract_bag_data.py#L16)） |
 
 > 原始 ZED bag **通常沒有深度 topic**，因此整條流程一律不使用深度（見 [注意事項](#5-注意事項--常見陷阱)）。
-> 若你的相機用的是 `rgb_raw` 而非 `right_raw`，執行時加 `--rgb-topic /zed2i/zed_node/rgb_raw/image_raw_color` 覆寫即可。
+> 若你的相機用的是 `right_raw` 而非 `rgb_raw`，執行時加 `--rgb-topic /zed2i/zed_node/right_raw/image_raw_color` 覆寫即可。
 
 ### 4 類語意調色盤（分割輸出與 Step 3 轉檔必須一致）
 
@@ -103,7 +103,7 @@ python3 bag_to_data.py --root <root> --start 1 --end N [--overwrite]
 ```
 
 - 參數：`--root`（預設 `.`）、`--start`（1）、`--end`（9）、`--overwrite`、
-  `--rgb-topic`（預設 `/zed2i/zed_node/right_raw/image_raw_color`）、`--odom-topic`（預設 `/odom`）。
+  `--rgb-topic`（預設 `/zed2i/zed_node/rgb_raw/image_raw_color`）、`--odom-topic`（預設 `/odom`）。
 - 預設不覆寫已存在的檔案，加 `--overwrite` 才會重寫。
 
 ### Step 2 — `dataset/0624bkgd/resample.py`：0.5 秒重採樣 → `resample/`
@@ -141,20 +141,23 @@ done
 
 ### Step 4 — `park_L2_ASAP.py`：路徑推論
 
-- **環境**：`conda activate stp3_env`。
+- **環境**：`conda activate stp3_ros`。
 - **輸入** `--dataroot` 指向某個 `resample/videoN`；載入器會讀取（[NuscenesData_0624_ASAP.py:52-53](stp3/data_0512_graduate/NuscenesData_0624_ASAP.py#L52-L53)、[:501-505](stp3/data_0512_graduate/NuscenesData_0624_ASAP.py#L501-L505)）：
   - `resample_index.csv`、`odom.csv`
   - `img/{img_timestep}.png`、`seg/{seg_timestep}.npy`
-  - 深度目前**停用**（`cfg.USE_DEPTH = False`，[park_L2_ASAP.py:627](park_L2_ASAP.py#L627)），故不需要 `depth_infer/`。
+  - 深度**必須自己用 `--no-depth` 關掉**：`use_depth` 預設是 `True`（[park_L2_ASAP.py:565](park_L2_ASAP.py#L565)、[:1082](park_L2_ASAP.py#L1082)），
+    不加旗標載入器就會去找 `depth_infer/{ts}.npy` 而中斷（[NuscenesData_0624_ASAP.py:577](stp3/data_0512_graduate/NuscenesData_0624_ASAP.py#L577)）。
+    這條流程一路不產生深度，故 Step 4 一律要加 `--no-depth`。
 - **checkpoint**：`--checkpoint`（預設 `last.ckpt`）；本機請用 `model/best-box-col-*.ckpt`。
   > ⚠️ **`checkpoint/last.ckpt` 不是完整模型**：只有 10 個 tensor（純 AD-MLP planner head，3.4MB），
   > **不含 `model.vlm.*` 視覺權重**，無法推論。完整模型是 `model/best-box-col-*.ckpt`（646 個 tensor）。
 
 ```bash
-conda activate stp3_env
+conda activate stp3_ros
 python park_L2_ASAP.py \
     --checkpoint "model/best-box-col-epoch=24-epoch_val_plan_obj_box_col=0.0054.ckpt" \
-    --dataroot dataset/0624bkgd/resample/video1
+    --dataroot dataset/0624bkgd/resample/video1 \
+    --no-depth
 ```
 
 - **輸出**：每次執行都集中在 `inference/imgs/<MMDDHHMMSS>/`（每次執行一個時間戳資料夾，不覆蓋前次，[park_L2_ASAP.py:40](park_L2_ASAP.py#L40)、[:564](park_L2_ASAP.py#L564)），內含：
@@ -173,7 +176,7 @@ senpai/
 ├── resample.py                # （舊版，勿用；請改用 dataset/0624bkgd/resample.py）
 ├── convert_cls4png_to_npy.py  # Step 3：seg PNG → class-id .npy
 ├── park_L2_ASAP.py            # Step 4：路徑推論主程式
-├── environment.yml            # conda 環境定義（name: stp3_env）
+├── environment.yml            # 另一台機器的 conda 環境定義（name: stp3_env，本機不用）
 ├── checkpoint/
 │   └── last.ckpt              # ⚠️ 非主權重：純 AD-MLP baseline（10 tensor）
 │                              #    被完整模型當凍結 coarse baseline 載入，勿刪
@@ -215,11 +218,12 @@ for d in dataset/0624bkgd/resample/video*/seg; do
     python3 convert_cls4png_to_npy.py --root "$d" --force
 done
 
-# Step 4（stp3_env）：推論路徑
-conda activate stp3_env
+# Step 4（stp3_ros）：推論路徑
+conda activate stp3_ros
 python park_L2_ASAP.py \
     --checkpoint "model/best-box-col-epoch=24-epoch_val_plan_obj_box_col=0.0054.ckpt" \
-    --dataroot dataset/0624bkgd/resample/video1
+    --dataroot dataset/0624bkgd/resample/video1 \
+    --no-depth
 ```
 
 ---
@@ -231,7 +235,8 @@ python park_L2_ASAP.py \
 訂閱相機與 `/odom`，內部跑 SegFormer + ST-P3，直接把預測路徑以 `nav_msgs/Path` 發到 `/senpai/path`。
 
 ```bash
-source /opt/ros/noetic/setup.bash   # 注意：即時節點用 noetic python3，不是 stp3_env
+source /opt/ros/noetic/setup.bash   # 提供 ROS 環境變數
+conda activate stp3_ros             # 即時節點同樣用 stp3_ros（系統 python3 缺 pyquaternion 等套件）
 python3 realtime/realtime_planner_node.py
 ```
 
@@ -245,8 +250,9 @@ python3 realtime/realtime_planner_node.py
 - **`checkpoint/last.ckpt` 不可當主權重**：它是純 AD-MLP baseline（只吃 21 維狀態、不看影像）的存檔，只有 10 個 tensor，缺全部 633 個 `model.vlm.*` 視覺權重 → strict 載入會直接 `RuntimeError: Missing key(s)`。請一律用 `model/best-box-col-*.ckpt`。**但不要刪除它** —— 完整模型會把它當凍結的 AD-MLP coarse baseline 載入（`codex_pure_ASAP.py:16` 寫死路徑），缺檔會無法建構模型。
 - **convert 的 `--root` 只能指向 `seg/`**：convert 遞迴抓所有 `*.png` 且無檔名過濾，指向整個 `resample/videoN`（含 `img/` 相片）會在 strict 模式報未知色錯誤。
 - **resample 用新版**：請用 `dataset/0624bkgd/resample.py`（無 poseimu、支援 `--no-depth`）。頂層 `resample.py` 為舊版，會強制要求每個 video 內有 `poseimu_zero.csv` 與 `depth/`，缺檔會直接中斷。
-- **深度全程停用**：原始 ZED bag 通常無深度 topic；`bag_to_data.py` 不輸出深度、Step 2 加 `--no-depth`、Step 4 推論設定 `USE_DEPTH = False`，一路一致。
-- **環境分離**：Step 1–3 用 ROS noetic 的 `python3`；Step 4 用 `stp3_env`。兩者是不同環境（py3.8 vs py3.9），勿混用。
+- **深度全程停用，且兩處都要自己加旗標**：原始 ZED bag 通常無深度 topic；`bag_to_data.py` 不輸出深度，
+  Step 2 與 **Step 4 都必須加 `--no-depth`**（兩者的預設都是「用深度」，忘記加就會找不到 `depth_infer/` 而中斷）。
+- **環境分離**：Step 1–3 用 ROS noetic 的 `python3`；Step 4 用 conda `stp3_ros`。兩者是不同環境（無法互相 import `rosbag`），勿混用。
 - **調色盤一致性**：分割輸出顏色必須與 Step 3 的 `PALETTE4` 完全一致；`bag_to_data.py` 存檔時做 RGB→BGR 轉換即是為此，否則 Step 3 在 strict 模式下會因未知顏色報錯。
 
 ---

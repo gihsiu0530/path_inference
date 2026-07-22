@@ -213,7 +213,7 @@ def depth_numpy_to_rosimg(depth: np.ndarray, header, encoding: str) -> RosImage:
 class SegFormerRealtimeNode:
     def __init__(self):
         # self.in_topic  = rospy.get_param("~in_topic", "/zed2i/zed_node/rgb_raw/image_raw_color") //平常改成rgb
-        self.in_topic  = rospy.get_param("~in_topic", "/zed2i/zed_node/right_raw/image_raw_color")
+        self.in_topic  = rospy.get_param("~in_topic", "/zed2i/zed_node/rgb_raw/image_raw_color")
         # self.in_topic  = rospy.get_param("~in_topic", "/zed2i/zed_node/stereo_raw/image_raw_color")
         self.depth_topic = rospy.get_param("~depth_topic", "/zed2i/zed_node/depth/depth_registered")
         self.out_topic = rospy.get_param("~out_topic", "/seg_cls4_224")
