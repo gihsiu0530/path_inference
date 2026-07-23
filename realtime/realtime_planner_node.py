@@ -234,7 +234,7 @@ class RealtimePlannerNode:
         # Same global trajectory as path_global, but flattened to [x0,y0,x1,y1,...]
         # as std_msgs/Float64MultiArray so the MPC chain (local_path -> mpc) can
         # consume it unchanged in place of global_path's CSV route (array_topic).
-        self.array_topic = rospy.get_param("~array_topic", "array_topic")
+        self.array_topic = rospy.get_param("~array_topic", "/senpai/array_topic")
         self.seg_topic = rospy.get_param("~seg_topic", "/senpai/seg_cls4_224")
         self.frame_id = rospy.get_param("~frame_id", "base_link")
         self.checkpoint = rospy.get_param("~checkpoint", DEFAULT_CHECKPOINT)
