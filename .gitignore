@@ -7,4 +7,9 @@ __pycache__/
 *.csv
 *.bag
 .vscode/
-dataset/
+# Ignore dataset payloads, but keep the pipeline scripts the README documents.
+# Must use dataset/** (not dataset/): a directory-form rule stops git from
+# descending, which would make the negations below unreachable.
+dataset/**
+!dataset/**/
+!dataset/**/*.py
