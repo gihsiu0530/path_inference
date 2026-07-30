@@ -61,6 +61,7 @@ from park_L2_ASAP import (
     _prepare_l2_labels,
     save_inference_plot,
     _input_history_from_egomotion,
+    _trajectory_xy_error,
 )
 from stp3.utils.geometry import mat2pose_vec
 
@@ -246,8 +247,8 @@ class RealtimePlannerNode:
         # match physical intent. Set false to feed the raw label through.
         self.flip_command = bool(rospy.get_param("~flip_command", True))
         # Save an offline-style inference plot (camera image + trajectory panel)
-        # per inference cycle. Off by default so normal runs stay lightweight.
-        self.save_plots = bool(rospy.get_param("~save_plots", False))
+        # per inference cycle. On by default; set false for a lightweight run.
+        self.save_plots = bool(rospy.get_param("~save_plots", True))
 
         default_device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = rospy.get_param("~device", default_device)
@@ -293,6 +294,9 @@ class RealtimePlannerNode:
         # Lazily created on the first saved plot (avoids leaving an empty dir).
         self._plot_dir = None
         self._plot_seq = 0
+        # Inferences waiting for their retrospective GT to fill in; at most
+        # N_FUTURE_FRAMES entries (~150 kB each, for the buffered camera frame).
+        self._pending = deque()
 
         self.pub_path = rospy.Publisher(self.path_topic, Path, queue_size=1)
         self.pub_path_global = rospy.Publisher(
@@ -318,7 +322,9 @@ class RealtimePlannerNode:
                       f"(LEFT/RIGHT swapped before the model)")
         if self.save_plots:
             rospy.loginfo("[planner] save_plots=true: inference plots -> "
-                          "realtime/inference/<ts>/inference_plots/")
+                          "realtime/inference/<ts>/inference_plots/ "
+                          f"(each plot lands {N_FUTURE_FRAMES * self.sample_interval:.1f}s late, "
+                          "once its GT is known; _save_plots:=false to disable)")
 
     # ---------- callbacks ----------
 
@@ -351,6 +357,10 @@ class RealtimePlannerNode:
                           f"{self.last_sample_time - now:.1f}s; resetting history")
             self.buffer = RealtimeSequenceBuffer()
             self.last_sample_time = None
+            # Pending plots belong to the old timeline: write them out with the
+            # GT collected so far, before _plot_dir moves on. Order matters —
+            # flushing after the reset below would file them under the new dir.
+            self._flush_pending(force=True)
             # Treat a clock restart as a new run: start a fresh plot folder so
             # each bag replay lands in its own realtime/inference/<ts>/ dir.
             self._plot_dir = None
@@ -383,7 +393,13 @@ class RealtimePlannerNode:
         seg_id_224 = self.segment(rgb)
         t_seg = time.perf_counter()
 
-        self.buffer.push(rgb_224, seg_id_224, pose_matrix_from_odom(self.last_odom))
+        pose = pose_matrix_from_odom(self.last_odom)
+        self.buffer.push(rgb_224, seg_id_224, pose)
+
+        # This pose is a *future* point for every inference already queued, so
+        # feed it in before this cycle enqueues its own record below — that way a
+        # record never consumes its own pose and each collects exactly t+1..t+6.
+        self._advance_pending(pose)
 
         self.pub_seg.publish(rgb_numpy_to_rosimg(colorize_cls4_rgb(seg_id_224), msg.header))
 
@@ -400,8 +416,7 @@ class RealtimePlannerNode:
         self.pub_array.publish(
             self.build_array_topic(final_traj, self.last_odom))
 
-        if self.save_plots:
-            self.save_plot(final_traj, msg.header.stamp)
+        self._enqueue_plot(final_traj, msg.header.stamp, pose)
 
         rospy.loginfo_throttle(
             1.0,
@@ -575,15 +590,18 @@ class RealtimePlannerNode:
             rospy.loginfo(f"[planner] saving inference plots -> {self._plot_dir}")
         return self._plot_dir
 
-    def save_plot(self, final_traj: np.ndarray, stamp) -> None:
+    def _enqueue_plot(self, final_traj: np.ndarray, stamp, pose: np.ndarray) -> None:
         """
-        Offline-style combo plot (camera image + trajectory panel), reusing
-        park_L2_ASAP.save_inference_plot. Realtime has no future GT, so gt/l2 are
-        empty (the panel then omits the blue GT track and the L2 text). The pred x
-        sign is flipped exactly like the offline path (park_L2_ASAP.py:718) so the
-        panel orientation matches; this copy never touches the published paths.
+        Queue one inference for plotting once its GT is known.
+
+        Everything the plot needs from the *current* observation is captured here,
+        because the ring buffers will have moved on by the time the record is
+        written out 3 s later. The pred x sign is flipped exactly like the offline
+        path (park_L2_ASAP.py:718) so the panel orientation matches; this copy
+        never touches the published paths.
         """
-        rgb_224 = self.buffer.rgb[-1]
+        if not self.save_plots:
+            return
 
         pred = np.asarray(final_traj, dtype=np.float64).copy()
         if pred.shape[1] == 2:
@@ -593,26 +611,84 @@ class RealtimePlannerNode:
         fego = torch.from_numpy(self.buffer.build_future_egomotion()).float()
         input_xy, input_yaw = _input_history_from_egomotion(fego)
 
-        gt = np.zeros((0, 3), dtype=np.float32)
-        l2 = np.zeros((0,), dtype=np.float32)
+        self._pending.append({
+            'seq_idx': self._plot_seq,
+            't_ref': stamp.to_nsec(),
+            'rgb_224': np.array(self.buffer.rgb[-1], copy=True),
+            'pred': pred,
+            'input_xy': input_xy,
+            'input_yaw': input_yaw,
+            'pose_inv': np.linalg.inv(pose),
+            'future': [],   # driven path in this record's planning frame
+        })
+        self._plot_seq += 1
+
+    def _advance_pending(self, pose: np.ndarray) -> None:
+        """
+        Record `pose` as the next driven waypoint of every queued inference, and
+        write out the ones whose 3 s of GT is now complete. In steady state this
+        writes exactly one plot per cycle, so the per-cycle cost stays flat.
+        """
+        for rec in self._pending:
+            rec['future'].append(relative_xy_yaw(rec['pose_inv'], pose))
+
+        while self._pending and len(self._pending[0]['future']) >= N_FUTURE_FRAMES:
+            self._write_plot(self._pending.popleft())
+
+    def _flush_pending(self, force: bool = False) -> None:
+        """
+        Drain the queue. With force=True the still-incomplete records are written
+        using the GT collected so far (shorter blue track) — used on shutdown and
+        on a clock restart, so the last few inferences of a run still get a plot.
+        """
+        while self._pending:
+            rec = self._pending.popleft()
+            if force or len(rec['future']) >= N_FUTURE_FRAMES:
+                self._write_plot(rec)
+
+    def _write_plot(self, rec: dict) -> None:
+        """
+        Offline-style combo plot (camera image + trajectory panel), reusing
+        park_L2_ASAP.save_inference_plot. GT is the path the robot actually drove,
+        in the same (x_left, y_front, yaw) convention and same leading (0,0,0) row
+        as the offline loader's gt_trajectory
+        (NuscenesData_0624_ASAP.get_gt_trajectory), so it needs no sign flip.
+        """
+        future = rec['future']
+        if future:
+            gt = np.vstack([np.zeros((1, 3)), np.asarray(future, dtype=np.float64)])
+            # _trajectory_xy_error clamps to min(T), which is what makes a
+            # force-flushed record with partial GT work.
+            xy_error = _trajectory_xy_error(
+                torch.from_numpy(rec['pred']).float().unsqueeze(0),
+                torch.from_numpy(gt).float().unsqueeze(0),
+            )
+            l2 = torch.linalg.norm(xy_error, dim=-1)[0].numpy()
+        else:
+            # Force-flushed before a single future pose arrived: fall back to the
+            # input + pred panel rather than drawing a lone GT dot at the origin.
+            gt = np.zeros((0, 3), dtype=np.float32)
+            l2 = np.zeros((0,), dtype=np.float32)
 
         save_inference_plot(
-            rgb_224=rgb_224,
-            pred=pred,
+            rgb_224=rec['rgb_224'],
+            pred=rec['pred'],
             gt=gt,
             l2=l2,
-            t_ref=stamp.to_nsec(),
-            seq_idx=self._plot_seq,
+            t_ref=rec['t_ref'],
+            seq_idx=rec['seq_idx'],
             out_dir=self._ensure_plot_dir(),
-            input_xy=input_xy,
-            input_yaw=input_yaw,
+            input_xy=rec['input_xy'],
+            input_yaw=rec['input_yaw'],
         )
-        self._plot_seq += 1
 
 
 def main():
     rospy.init_node("realtime_planner_node", anonymous=False)
-    RealtimePlannerNode()
+    node = RealtimePlannerNode()
+    # The last few inferences of a run never see their full 3 s of GT; write them
+    # out with what was collected instead of dropping them.
+    rospy.on_shutdown(lambda: node._flush_pending(force=True))
     rospy.spin()
 
 

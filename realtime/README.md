@@ -75,7 +75,7 @@ conda activate stp3_ros
 | 發布 | `~array_topic` | `array_topic` | `std_msgs/Float64MultiArray`（給 MPC 控制器） |
 | 發布 | `~seg_topic` | `/senpai/seg_cls4_224` | `sensor_msgs/Image`（除錯用） |
 
-其他參數：`~checkpoint`、`~frame_id`（預設 `base_link`）、`~sample_interval`（預設 `0.5`）、`~device`、`~use_fp16`、`~save_plots`（預設 `false`）。
+其他參數：`~checkpoint`、`~frame_id`（預設 `base_link`）、`~sample_interval`（預設 `0.5`）、`~device`、`~use_fp16`、`~save_plots`（預設 `true`）。
 
 ### 給 MPC 控制器的 `array_topic`
 
@@ -90,20 +90,35 @@ conda activate stp3_ros
 > ⚠️ **座標系一致性**：`array_topic` 的座標沿用 `~odom_topic` 訊息的 frame（此 bag 為 `map`）。
 > 必須確保 **本節點與控制器 `local_path` 吃的是同一個 `/odom` 定位來源**，最近點搜尋才會對齊。
 
-### 推論可視化圖（`~save_plots`）
+### 推論可視化圖（`~save_plots`，預設開啟）
 
-設 `_save_plots:=true` 時，每次推論會存一張**離線同風格的 combo 圖**到
-`realtime/inference/<MM_DD_HH_MM_SS>/inference_plots/`：
-左邊 224×224 相機影像、右邊軌跡面板（🟢 過去 input + 🔴 預測）。即時推論**沒有未來 GT**，
-所以不會有藍色 GT 軌跡、也沒有 L2 數字，其餘與 `inference/imgs/…/inference_plots` 一致。
+**預設就會**每次推論存一張**離線同風格的 combo 圖**到
+`realtime/inference/<MM_DD_HH_MM_SS>/inference_plots/`，檔名 `{序號:06d}_{時間戳ns}.png`：
+左邊 224×224 相機影像、右邊軌跡面板（🟢 過去 input + 🔵 GT + 🔴 預測 + L2 數字），
+與 `inference/imgs/…/inference_plots` 的圖一致。不想存圖時：
 
 ```bash
-python3 realtime/realtime_planner_node.py _save_plots:=true
+python3 realtime/realtime_planner_node.py _save_plots:=false
 ```
 
-**資料夾切換時機**：節點在**第一次推論**時建立第一個時間戳資料夾；之後**每次重播 bag**
+**GT 從何而來（圖會晚 3 秒落地）**：即時推論當下拿不到未來 GT，因此節點會把每次推論
+**排入佇列**，等後續 6 個 0.5s 取樣（= 3 s）到齊後，用機器人**實際走過的路徑**當 GT
+補畫並算 L2。所以圖比即時畫面**延遲約 3 秒**才出現，這是拿到真實 GT 的必要代價。
+GT 的座標算法與離線 loader 的 `get_gt_trajectory` 完全相同（`(x_left, y_front, yaw)`，
+開頭補 `(0,0,0)`），因此紅藍兩線可直接比對。
+
+> ⚠️ **L2 的意義要看有沒有閉環**：若 MPC 正在**追蹤本節點發出的路徑**（`array_topic` 那條鏈），
+> 機器人實際走的就會逼近預測本身，L2 會變成**自我實現的小數字**，不能當成離線那種
+> 「預測 vs. 人類駕駛」的預測誤差來看。要評估真正的預測品質，請在**開環**下看
+> （只跑本節點、由人操控或 bag 重播），或直接用離線 `park_L2_ASAP.py` 的 L2。
+
+**尾端影像**：Ctrl-C 停止節點（或偵測到時鐘重啟）時，最後未滿 3 s 的 ≤6 次推論會用
+**已收集到的部分 GT** 補畫出來（藍線較短），不會被丟掉；這幾張的 `L2 final=` 顯示的是
+**現有最後一步**而非第 6 步。
+
+**資料夾切換時機**：節點在**第一次寫圖**時建立第一個時間戳資料夾；之後**每次重播 bag**
 （偵測到時間倒退＝時鐘重啟）會自動**開一個新的時間戳資料夾**，不需重啟節點。同一段連續
-播放的所有圖都存在同一個資料夾。預設（不帶此參數）不產生任何檔案。
+播放的所有圖都存在同一個資料夾（舊資料夾的尾端圖會在切換前補齊）。
 
 ### command（必要，且無法自動取得）
 
