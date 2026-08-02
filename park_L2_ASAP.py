@@ -295,7 +295,13 @@ def _input_history_xy(future_egomotion: torch.Tensor) -> np.ndarray:
 
 def save_inference_plot(rgb_224: np.ndarray, pred: np.ndarray, gt: np.ndarray,
                         l2: np.ndarray, t_ref: int, seq_idx: int, out_dir: pathlib.Path,
-                        input_xy: np.ndarray = None, input_yaw: np.ndarray = None):
+                        input_xy: np.ndarray = None, input_yaw: np.ndarray = None,
+                        extra_panels: list = None):
+    """
+    extra_panels: optional [(label, HxWx3 uint8 RGB), ...] pasted between the
+    camera image and the trajectory panel, each labelled in the margin below it.
+    Left as None the combo is byte-identical to the two-panel original.
+    """
     if pred.shape[1] < 2 or gt.shape[1] < 2:
         return
 
@@ -406,9 +412,27 @@ def save_inference_plot(rgb_224: np.ndarray, pred: np.ndarray, gt: np.ndarray,
     draw_traj(gt_plot_xy, (40, 120, 255), (20, 80, 180), 4)
     draw_traj(pred_plot_xy, (220, 50, 50), (150, 20, 20), 3)
 
-    combo = Image.new("RGB", (img.width + traj_panel.width, max(img.height, traj_panel.height)), (255, 255, 255))
-    combo.paste(img, (0, 0))
-    combo.paste(traj_panel, (img.width, 0))
+    labels = [label for label, _ in (extra_panels or [])]
+    panels = [img]
+    panels += [Image.fromarray(np.asarray(panel_rgb, dtype=np.uint8), mode="RGB")
+               for _, panel_rgb in (extra_panels or [])]
+    panels.append(traj_panel)
+
+    combo = Image.new("RGB", (sum(p.width for p in panels),
+                              max(p.height for p in panels)), (255, 255, 255))
+    x_offset = 0
+    for panel in panels:
+        combo.paste(panel, (x_offset, 0))
+        x_offset += panel.width
+
+    # Label the extra panels in the margin *below* them (the traj panel is taller,
+    # so that space is blank anyway) — writing on the panel would hide pixels.
+    combo_draw = ImageDraw.Draw(combo)
+    x_offset = img.width
+    for label, panel in zip(labels, panels[1:1 + len(labels)]):
+        y = min(panel.height + 4, combo.height - 14)
+        combo_draw.text((x_offset + 3, y), label, fill=(30, 30, 30))
+        x_offset += panel.width
 
     out_path = out_dir / f"{seq_idx:06d}_{int(t_ref)}.png"
     combo.save(out_path)

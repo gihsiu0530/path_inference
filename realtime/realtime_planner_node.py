@@ -8,6 +8,7 @@ Single-process pipeline that replaces the offline four-step flow
 (bag_to_data -> resample -> convert_cls4png_to_npy -> park_L2_ASAP):
 
     camera + /odom  ->  SegFormer-B2 (4-class seg)  ->  ST-P3  ->  nav_msgs/Path
+                        Depth-Anything-V2 (rel. depth)  ^
 
 Runs on the ROS noetic python3 (3.8), which already provides rospy, torch,
 transformers, pytorch_lightning, pandas and pyquaternion. Do NOT run this in
@@ -98,6 +99,29 @@ DEFAULT_CHECKPOINT = os.path.join(
     _REPO_ROOT, "model", "best-box-col-epoch=24-epoch_val_plan_obj_box_col=0.0054.ckpt"
 )
 
+# Depth-Anything-V2 — the depth channel the ST-P3 checkpoint was trained on.
+#
+# The offline dataset's depth_infer/*.npy came from tools/Depth-Anything-V2/
+# infer_depth_da_v2.py run over the 224x224 crops, which takes that script's
+# *batch* branch (`model(x)`): BGR->RGB, /255, NO ImageNet normalisation, and the
+# 224x224 image straight into the network (224 = 16*14, so DINOv2's patch grid
+# divides evenly). infer_image()'s 518-resize + normalisation is the other branch
+# and produces different numbers — do not use it here.
+#
+# Both the package and the 1.3 GB weights are kept in-tree rather than referenced
+# from /home/cyc/dataset/: that tree is volatile (several dataset folders,
+# including the second Depth-Anything-V2 checkout, disappeared during a single
+# session), and a vanished default would stop the node from starting. The weights
+# are excluded from git by the *.pth rule, same as the ST-P3 *.ckpt.
+# Both stay overridable by rosparam.
+DEFAULT_DA_V2_REPO = os.path.join(_REPO_ROOT, "third_party", "Depth-Anything-V2")
+DEFAULT_DA_V2_CKPT = os.path.join(_REPO_ROOT, "model", "depth_anything_v2_vitl.pth")
+# vitl — the encoder the training depth was produced with. A smaller encoder
+# shifts the whole output distribution and the ST-P3 checkpoint has never seen it.
+DA_V2_ENCODER = "vitl"
+DA_V2_FEATURES = 256
+DA_V2_OUT_CHANNELS = [256, 512, 1024, 1024]
+
 
 def pose_matrix_from_odom(msg: Odometry) -> np.ndarray:
     """
@@ -130,6 +154,35 @@ def relative_xy_yaw(pose_curr_inv: np.ndarray, pose_other: np.ndarray):
     return [y_left, x_forward, yaw]
 
 
+def load_depth_anything_v2(repo_dir: str, ckpt_path: str, device: str):
+    """
+    Build the Depth-Anything-V2 vitl model used to produce the depth channel.
+
+    The import is done here rather than at module scope so that ~use_depth:=false
+    still starts on a machine where the package or the weights are missing.
+    """
+    if not os.path.isdir(repo_dir):
+        raise RuntimeError(
+            f"Depth-Anything-V2 repo not found: {repo_dir}\n"
+            "Point ~da_v2_repo at a checkout of it, or run with _use_depth:=false "
+            "(which feeds the model zero depth — not what the checkpoint was trained on)."
+        )
+    if not os.path.isfile(ckpt_path):
+        raise RuntimeError(
+            f"Depth-Anything-V2 weights not found: {ckpt_path}\n"
+            f"Point ~da_v2_ckpt at depth_anything_v2_{DA_V2_ENCODER}.pth."
+        )
+    if repo_dir not in sys.path:
+        sys.path.insert(0, repo_dir)
+
+    from depth_anything_v2.dpt import DepthAnythingV2
+
+    model = DepthAnythingV2(encoder=DA_V2_ENCODER, features=DA_V2_FEATURES,
+                            out_channels=DA_V2_OUT_CHANNELS)
+    model.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
+    return model.eval().to(device)
+
+
 class RealtimeSequenceBuffer:
     """
     Ring buffers holding the past observations the model needs, sampled on a
@@ -140,24 +193,33 @@ class RealtimeSequenceBuffer:
     the node stays in warm-up until both are full.
     """
 
-    def __init__(self):
+    def __init__(self, use_depth: bool = False):
         self.rgb = deque(maxlen=TIME_RECEPTIVE_FIELD)     # (224,224,3) uint8
         self.seg_id = deque(maxlen=TIME_RECEPTIVE_FIELD)  # (224,224)   uint8
         self.poses = deque(maxlen=ADMLP_PAST_FRAMES + 1)  # 4x4 matrices
+        # None when ~use_depth is off, which is also what tells build_batch to
+        # leave 'depth_224_seq' out of the batch entirely.
+        self.depth = deque(maxlen=TIME_RECEPTIVE_FIELD) if use_depth else None
 
-    def push(self, rgb_224, seg_id_224, pose):
+    def push(self, rgb_224, seg_id_224, pose, depth_224=None):
         self.rgb.append(rgb_224)
         self.seg_id.append(seg_id_224)
         self.poses.append(pose)
+        if self.depth is not None:
+            self.depth.append(depth_224)
 
     @property
     def ready(self) -> bool:
+        if self.depth is not None and len(self.depth) != self.depth.maxlen:
+            return False
         return (len(self.rgb) == self.rgb.maxlen
                 and len(self.poses) == self.poses.maxlen)
 
     def status(self) -> str:
+        depth = (f", depths {len(self.depth)}/{self.depth.maxlen}"
+                 if self.depth is not None else "")
         return (f"images {len(self.rgb)}/{self.rgb.maxlen}, "
-                f"poses {len(self.poses)}/{self.poses.maxlen}")
+                f"poses {len(self.poses)}/{self.poses.maxlen}{depth}")
 
     # ---------- model inputs derived from the pose history ----------
 
@@ -193,10 +255,35 @@ class RealtimeSequenceBuffer:
         acceleration = np.zeros(3, dtype=np.float64)  # degree 1 => no acceleration
         return velocity.astype(np.float32), acceleration.astype(np.float32)
 
-    def build_admlp_input(self, command: str) -> np.ndarray:
+    @staticmethod
+    def fixed_speed_history(speed: float):
+        """
+        Synthetic straight-line history at a constant speed, in the model's
+        (x_left, y_front, yaw) frame: the ego drove `speed` m/s straight
+        forward, so past pose k sits (k * SAMPLE_INTERVAL * speed) metres
+        behind the origin.
+
+        Uses the module-level SAMPLE_INTERVAL, not ~sample_interval: the
+        cadence the checkpoint assumes is what the feature must encode.
+
+        Feeding this through estimate_current_motion would fit exactly
+        [0, speed, 0] anyway (a degree-1 fit of a perfectly linear track), so
+        the velocity is written directly and the lstsq is skipped.
+        """
+        past = np.zeros((ADMLP_PAST_FRAMES, 3), dtype=np.float32)
+        for i in range(ADMLP_PAST_FRAMES):
+            past[i, 1] = -(ADMLP_PAST_FRAMES - i) * SAMPLE_INTERVAL * speed
+        velocity = np.asarray([0.0, speed, 0.0], dtype=np.float32)
+        acceleration = np.zeros(3, dtype=np.float32)
+        return past, velocity, acceleration
+
+    def build_admlp_input(self, command: str, fixed_speed: float = 0.0) -> np.ndarray:
         """21-dim feature — loader :478-494."""
-        past = self.admlp_past_trajectory()
-        velocity, acceleration = self.estimate_current_motion(past)
+        if fixed_speed > 0.0:
+            past, velocity, acceleration = self.fixed_speed_history(fixed_speed)
+        else:
+            past = self.admlp_past_trajectory()
+            velocity, acceleration = self.estimate_current_motion(past)
         command_onehot = np.asarray(COMMAND_TO_ONEHOT[command], dtype=np.float32)
         feature = np.concatenate(
             [past.reshape(-1), velocity, acceleration, command_onehot], axis=0
@@ -240,15 +327,32 @@ class RealtimePlannerNode:
         self.frame_id = rospy.get_param("~frame_id", "base_link")
         self.checkpoint = rospy.get_param("~checkpoint", DEFAULT_CHECKPOINT)
         self.sample_interval = float(rospy.get_param("~sample_interval", SAMPLE_INTERVAL))
-        # The checkpoint's command channel is inverted: feeding "LEFT" steers the
-        # path to the right and vice-versa (the model's dir_loss disagrees with
-        # the loader's LEFT/RIGHT labels; verified by a same-scene A/B test).
-        # Swapping LEFT<->RIGHT before the model makes the /senpai/command topic
-        # match physical intent. Set false to feed the raw label through.
-        self.flip_command = bool(rospy.get_param("~flip_command", True))
         # Save an offline-style inference plot (camera image + trajectory panel)
         # per inference cycle. On by default; set false for a lightweight run.
         self.save_plots = bool(rospy.get_param("~save_plots", True))
+        # Add the two segmentation panels (PALETTE4 + the model's own offset
+        # palette) to that plot. False falls back to the two-panel layout.
+        self.plot_seg = bool(rospy.get_param("~plot_seg", True))
+        # Add the Depth-Anything-V2 panel (min-max normalised, like the offline
+        # script's --save_vis). Ignored when ~use_depth is off.
+        self.plot_depth = bool(rospy.get_param("~plot_depth", True))
+        # Feed the model the Depth-Anything-V2 relative depth it was trained on.
+        # Off means a zero depth map reaches the fixed depth channel of the
+        # model's fusion layers — the channel cannot be removed, so "no depth"
+        # is really "constant depth", which is not what the checkpoint saw.
+        self.use_depth = bool(rospy.get_param("~use_depth", True))
+        self.da_v2_repo = rospy.get_param("~da_v2_repo", DEFAULT_DA_V2_REPO)
+        self.da_v2_ckpt = rospy.get_param("~da_v2_ckpt", DEFAULT_DA_V2_CKPT)
+        # Feed the model a synthetic "driving straight at N m/s" ego state instead
+        # of the velocity/past poses fitted from real odom. The model plans
+        # noticeably better when it believes the vehicle is moving, so this keeps
+        # the quality of a rolling start even at standstill. 0 (default) = use the
+        # real history. Only admlp_input is affected; future_egomotion, the
+        # published paths and the inference plots all stay on real odom.
+        self.fixed_speed = float(rospy.get_param("~fixed_speed", 0.0))
+        if self.fixed_speed < 0.0:
+            rospy.logwarn(f"[planner] ignoring negative ~fixed_speed={self.fixed_speed}")
+            self.fixed_speed = 0.0
 
         default_device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = rospy.get_param("~device", default_device)
@@ -261,6 +365,21 @@ class RealtimePlannerNode:
         self.segformer = SegformerForSemanticSegmentation.from_pretrained(
             SEGFORMER_NAME
         ).to(self.device).eval()
+
+        # ---------- Depth-Anything-V2 ----------
+        # Kept in fp32: the benchmark put it at 17.8 ms/frame against 13.4 ms
+        # under autocast, and fp32 actually needs less memory (1.4 vs 2.1 GB)
+        # because autocast keeps a cast buffer. 17.8 ms is 3.6% of the 0.5 s
+        # cycle, so the faster path buys nothing worth the extra memory.
+        self.depth_model = None
+        if self.use_depth:
+            if self.device == "cpu":
+                rospy.logwarn("[planner] use_depth=true on CPU: vitl takes ~17.8 ms on a "
+                              "4070 SUPER but seconds on CPU, which will not hold the "
+                              f"{self.sample_interval:.1f} s cadence")
+            rospy.loginfo(f"[planner] loading Depth-Anything-V2 {self.da_v2_ckpt}")
+            self.depth_model = load_depth_anything_v2(
+                self.da_v2_repo, self.da_v2_ckpt, self.device)
 
         # ---------- ST-P3 ----------
         rospy.loginfo(f"[planner] loading checkpoint {self.checkpoint}")
@@ -286,7 +405,7 @@ class RealtimePlannerNode:
         if self.device == "cuda":
             torch.backends.cudnn.benchmark = True
 
-        self.buffer = RealtimeSequenceBuffer()
+        self.buffer = RealtimeSequenceBuffer(self.use_depth)
         self.command = "FORWARD"
         self.last_odom = None
         self.last_sample_time = None
@@ -295,7 +414,8 @@ class RealtimePlannerNode:
         self._plot_dir = None
         self._plot_seq = 0
         # Inferences waiting for their retrospective GT to fill in; at most
-        # N_FUTURE_FRAMES entries (~150 kB each, for the buffered camera frame).
+        # N_FUTURE_FRAMES entries (~400 kB each: 150 kB camera frame, 50 kB seg
+        # ids, 200 kB depth when ~use_depth is on), so ~2.4 MB fully loaded.
         self._pending = deque()
 
         self.pub_path = rospy.Publisher(self.path_topic, Path, queue_size=1)
@@ -318,13 +438,30 @@ class RealtimePlannerNode:
         rospy.loginfo(f"[planner] publish   path    {self.path_topic} ({self.frame_id})")
         rospy.loginfo(f"[planner] publish   path    {self.path_global_topic} (odom, global)")
         rospy.loginfo(f"[planner] publish   array   {self.array_topic} (Float64MultiArray, for MPC)")
-        rospy.loginfo(f"[planner] flip_command={self.flip_command} "
-                      f"(LEFT/RIGHT swapped before the model)")
+        if self.use_depth:
+            rospy.loginfo("[planner] use_depth=true: Depth-Anything-V2 relative depth "
+                          f"({DA_V2_ENCODER}) -> depth_224_seq, as the checkpoint was trained")
+        else:
+            rospy.logwarn("[planner] use_depth=false: the model gets a ZERO depth map. "
+                          "The checkpoint was trained with real Depth-Anything-V2 depth, "
+                          "so this is a train/inference mismatch")
+        if self.fixed_speed > 0.0:
+            rospy.loginfo(f"[planner] fixed_speed={self.fixed_speed:.2f} m/s: admlp_input uses "
+                          "a synthetic straight-line history (real odom still drives "
+                          "future_egomotion and the published paths)")
         if self.save_plots:
+            panels = ["camera"]
+            if self.plot_seg:
+                panels += ["seg PALETTE4", "seg model-input"]
+            if self.plot_depth and self.use_depth:
+                panels.append("depth DA-V2")
+            layout = " | ".join(panels + ["trajectory"])
             rospy.loginfo("[planner] save_plots=true: inference plots -> "
                           "realtime/inference/<ts>/inference_plots/ "
+                          f"[{layout}] "
                           f"(each plot lands {N_FUTURE_FRAMES * self.sample_interval:.1f}s late, "
-                          "once its GT is known; _save_plots:=false to disable)")
+                          "once its GT is known; _save_plots:=false to disable, "
+                          "_plot_seg:=false to drop the seg panels)")
 
     # ---------- callbacks ----------
 
@@ -355,7 +492,7 @@ class RealtimePlannerNode:
         if self.last_sample_time is not None and now < self.last_sample_time:
             rospy.logwarn(f"[planner] time jumped backwards by "
                           f"{self.last_sample_time - now:.1f}s; resetting history")
-            self.buffer = RealtimeSequenceBuffer()
+            self.buffer = RealtimeSequenceBuffer(self.use_depth)
             self.last_sample_time = None
             # Pending plots belong to the old timeline: write them out with the
             # GT collected so far, before _plot_dir moves on. Order matters —
@@ -393,8 +530,11 @@ class RealtimePlannerNode:
         seg_id_224 = self.segment(rgb)
         t_seg = time.perf_counter()
 
+        depth_224 = self.infer_depth(rgb_224) if self.use_depth else None
+        t_depth = time.perf_counter()
+
         pose = pose_matrix_from_odom(self.last_odom)
-        self.buffer.push(rgb_224, seg_id_224, pose)
+        self.buffer.push(rgb_224, seg_id_224, pose, depth_224)
 
         # This pose is a *future* point for every inference already queued, so
         # feed it in before this cycle enqueues its own record below — that way a
@@ -418,9 +558,11 @@ class RealtimePlannerNode:
 
         self._enqueue_plot(final_traj, msg.header.stamp, pose)
 
+        depth_ms = (f"depth={1000*(t_depth-t_seg):.1f} ms | " if self.use_depth else "")
         rospy.loginfo_throttle(
             1.0,
-            f"[planner] seg={1000*(t_seg-t0):.1f} ms | plan={1000*(t_plan-t_seg):.1f} ms "
+            f"[planner] seg={1000*(t_seg-t0):.1f} ms | {depth_ms}"
+            f"plan={1000*(t_plan-t_depth):.1f} ms "
             f"| total={1000*(t_plan-t0):.1f} ms | command={self.command}"
         )
 
@@ -443,11 +585,27 @@ class RealtimePlannerNode:
         cls4 = logits19_to_cls4(logits).unsqueeze(1)
         return resize_keep_ratio_center_crop_uint8(cls4)[0, 0].cpu().numpy()
 
-    def model_command(self) -> str:
-        """Command actually fed to the model — see ~flip_command in __init__."""
-        if self.flip_command and self.command in ("LEFT", "RIGHT"):
-            return "RIGHT" if self.command == "LEFT" else "LEFT"
-        return self.command
+    @torch.inference_mode()
+    def infer_depth(self, rgb_224: np.ndarray) -> np.ndarray:
+        """
+        (224,224,3) uint8 RGB -> (224,224) float32 relative inverse depth, i.e.
+        larger = closer, with a per-frame scale (measured drift across
+        consecutive frames: ~2% of the frame maximum).
+
+        Reproduces infer_depth_da_v2.py's batch branch bit for bit: /255 only —
+        no ImageNet mean/std — and no resize, since the crop is already 224.
+        The fp16 round-trip is what the offline `.npy` files went through
+        (`--dtype_fp16`), reproduced so the model sees the same quantisation.
+
+        Values land around 14..330 on this data while the model's own _depth()
+        does clamp(0,80)/80, so roughly three quarters of the pixels saturate.
+        That is what the checkpoint was trained on: rescaling to "use the range
+        properly" would move the input off the trained distribution.
+        """
+        x = torch.from_numpy(np.ascontiguousarray(rgb_224))
+        x = x.permute(2, 0, 1).float().div_(255.0).unsqueeze(0).to(self.device)
+        depth = self.depth_model(x)[0].float().cpu().numpy()
+        return depth.astype(np.float16).astype(np.float32)
 
     def build_batch(self) -> dict:
         """Reproduces the offline loader's __getitem__ contract, with B=1."""
@@ -455,14 +613,15 @@ class RealtimePlannerNode:
         seg_id_seq = np.stack(list(self.buffer.seg_id), axis=0)  # (3,224,224)
         seg_rgb_seq = SEG_PALETTE[seg_id_seq]                    # (3,224,224,3)
 
-        command = self.model_command()  # LEFT/RIGHT swapped if flip_command
+        command = self.command
         empty = torch.empty(0)
         batch = {
             'rgb_224_seq': torch.from_numpy(rgb_seq).unsqueeze(0),
             'seg_224_seq': torch.from_numpy(seg_rgb_seq).unsqueeze(0),
             'seg_id_224_seq': torch.from_numpy(seg_id_seq.astype(np.int64)).unsqueeze(0),
             'future_egomotion': torch.from_numpy(self.buffer.build_future_egomotion()).unsqueeze(0),
-            'admlp_input': torch.from_numpy(self.buffer.build_admlp_input(command)).unsqueeze(0),
+            'admlp_input': torch.from_numpy(
+                self.buffer.build_admlp_input(command, self.fixed_speed)).unsqueeze(0),
             'command': [command],
             'target_point': torch.zeros(1, 2, dtype=torch.float32),
             # gt_trajectory never reaches the prediction: codex_pure_ASAP.py:756-770
@@ -478,9 +637,25 @@ class RealtimePlannerNode:
             'extrinsics': empty,
             'sample_trajectory': empty,
         }
+        # Only present when ~use_depth is on. Leaving the key out is what makes
+        # _call_model_forward (park_L2_ASAP.py:486) skip the kwarg, which in turn
+        # makes codex_pure_ASAP.forward substitute its zero-depth placeholder —
+        # the same fallback the offline `--no-depth` run takes.
+        if self.buffer.depth is not None:
+            depth_seq = np.stack(list(self.buffer.depth), axis=0)  # (3,224,224)
+            batch['depth_224_seq'] = torch.from_numpy(depth_seq).float().unsqueeze(0)
         return batch
 
     def plan(self) -> np.ndarray:
+        """
+        One inference, as (6, 3) rows of (x_left, y_front, yaw).
+
+        The model's own lateral channel is +right, the opposite of the loader's
+        gt_trajectory convention, so it is flipped here — once, for every
+        consumer — exactly like the offline path (park_L2_ASAP.py:742). Verified
+        against the offline dump: with the flip, all 177 turning samples
+        (|gt_x| >= 1) match the GT sign and corr(gt_x, pred_x) is 0.88.
+        """
         batch = self.build_batch()
         labels = _prepare_l2_labels(batch)
 
@@ -489,7 +664,11 @@ class RealtimePlannerNode:
         output, is_vlm_gen = _call_model_forward(self.model, batch, self.device)
         _, final_traj = _call_model_planning(
             self.model, output, labels, batch, self.n_present, self.device, is_vlm_gen)
-        return final_traj[0].detach().float().cpu().numpy()  # (6,3)
+        # .copy() so the in-place flip never writes through to the model's own
+        # tensor, which numpy() shares storage with on a CPU device.
+        traj = final_traj[0].detach().float().cpu().numpy().copy()  # (6,3)
+        traj[:, 0] *= -1.0  # model lateral is +right -> x_left
+        return traj
 
     def build_path(self, traj: np.ndarray, stamp) -> Path:
         """
@@ -596,9 +775,9 @@ class RealtimePlannerNode:
 
         Everything the plot needs from the *current* observation is captured here,
         because the ring buffers will have moved on by the time the record is
-        written out 3 s later. The pred x sign is flipped exactly like the offline
-        path (park_L2_ASAP.py:718) so the panel orientation matches; this copy
-        never touches the published paths.
+        written out 3 s later. The trajectory arrives already in the plot's
+        (x_left, y_front) convention — plan() does the one lateral flip — so this
+        copy only pads the yaw column when the model returns bare xy.
         """
         if not self.save_plots:
             return
@@ -606,7 +785,6 @@ class RealtimePlannerNode:
         pred = np.asarray(final_traj, dtype=np.float64).copy()
         if pred.shape[1] == 2:
             pred = np.concatenate([pred, np.zeros((pred.shape[0], 1))], axis=1)
-        pred[:, 0] *= -1.0
 
         fego = torch.from_numpy(self.buffer.build_future_egomotion()).float()
         input_xy, input_yaw = _input_history_from_egomotion(fego)
@@ -615,6 +793,10 @@ class RealtimePlannerNode:
             'seq_idx': self._plot_seq,
             't_ref': stamp.to_nsec(),
             'rgb_224': np.array(self.buffer.rgb[-1], copy=True),
+            # Same frame as rgb_224: process() pushes all three before enqueueing.
+            'seg_id_224': np.array(self.buffer.seg_id[-1], copy=True),
+            'depth_224': (np.array(self.buffer.depth[-1], copy=True)
+                          if self.buffer.depth is not None else None),
             'pred': pred,
             'input_xy': input_xy,
             'input_yaw': input_yaw,
@@ -646,10 +828,46 @@ class RealtimePlannerNode:
             if force or len(rec['future']) >= N_FUTURE_FRAMES:
                 self._write_plot(rec)
 
+    def _seg_panels(self, rec: dict) -> list:
+        """
+        The two segmentation panels for the combo plot, both derived from the
+        same class-id map the model was fed:
+
+        - PALETTE4     — colorize_cls4_rgb, i.e. exactly what /senpai/seg_cls4_224
+                         and the offline dataset PNGs (bag_to_data.py) look like.
+        - model-input  — SEG_PALETTE indexed the same way as build_batch, i.e. the
+                         literal pixels that reach the checkpoint. Deliberately
+                         *not* labelled by palette name: road reads black here
+                         because of the documented one-class offset above, and
+                         that is not a bug to fix.
+        """
+        seg_id = rec.get('seg_id_224')
+        if not self.plot_seg or seg_id is None:
+            return []
+        return [
+            ("SEG PALETTE4", colorize_cls4_rgb(seg_id)),
+            ("SEG model-input", SEG_PALETTE[seg_id]),
+        ]
+
+    def _depth_panel(self, rec: dict) -> list:
+        """
+        The Depth-Anything-V2 panel, min-max normalised per frame exactly like
+        infer_depth_da_v2.py's --save_vis. Bright = near (the raw values are
+        inverse depth). This is a *visualisation* stretch only — the model is
+        still fed the raw, unnormalised values.
+        """
+        depth = rec.get('depth_224')
+        if not self.plot_depth or depth is None:
+            return []
+        d = depth.astype(np.float32)
+        d = (d - d.min()) / (d.max() - d.min() + 1e-8)
+        gray = (d * 255.0).clip(0, 255).astype(np.uint8)
+        return [("DEPTH DA-V2 (bright=near)", np.repeat(gray[..., None], 3, axis=2))]
+
     def _write_plot(self, rec: dict) -> None:
         """
-        Offline-style combo plot (camera image + trajectory panel), reusing
-        park_L2_ASAP.save_inference_plot. GT is the path the robot actually drove,
+        Offline-style combo plot (camera image + seg panels + trajectory panel),
+        reusing park_L2_ASAP.save_inference_plot. GT is the path the robot drove,
         in the same (x_left, y_front, yaw) convention and same leading (0,0,0) row
         as the offline loader's gt_trajectory
         (NuscenesData_0624_ASAP.get_gt_trajectory), so it needs no sign flip.
@@ -680,6 +898,7 @@ class RealtimePlannerNode:
             out_dir=self._ensure_plot_dir(),
             input_xy=rec['input_xy'],
             input_yaw=rec['input_yaw'],
+            extra_panels=self._seg_panels(rec) + self._depth_panel(rec),
         )
 
 

@@ -6,7 +6,8 @@
 ```
                               鍵盤 ─→ /senpai/command ┐
                                                       ▼
-相機 + /odom ─→ SegFormer-B2（4 類分割）─→ ST-P3 ─→ nav_msgs/Path ─→ 即時視窗
+相機 + /odom ─→ SegFormer-B2（4 類分割）──┬─→ ST-P3 ─→ nav_msgs/Path ─→ 即時視窗
+             └→ Depth-Anything-V2（相對深度）┘
 ```
 
 三支節點：
@@ -75,7 +76,80 @@ conda activate stp3_ros
 | 發布 | `~array_topic` | `array_topic` | `std_msgs/Float64MultiArray`（給 MPC 控制器） |
 | 發布 | `~seg_topic` | `/senpai/seg_cls4_224` | `sensor_msgs/Image`（除錯用） |
 
-其他參數：`~checkpoint`、`~frame_id`（預設 `base_link`）、`~sample_interval`（預設 `0.5`）、`~device`、`~use_fp16`、`~save_plots`（預設 `true`）。
+其他參數：`~checkpoint`、`~frame_id`（預設 `base_link`）、`~sample_interval`（預設 `0.5`）、`~device`、`~use_fp16`、`~save_plots`（預設 `true`）、`~plot_seg`（預設 `true`，推論圖是否附上語意分割面板）、`~plot_depth`（預設 `true`，推論圖是否附上深度面板）、`~fixed_speed`（預設 `0.0` = 關閉，見下）、`~use_depth`（預設 **`true`**，見下）、`~da_v2_repo`、`~da_v2_ckpt`。
+
+### 深度輸入（`~use_depth`，預設**開啟**）
+
+checkpoint **是用真實深度訓練的**，所以這個預設是 `true`，不要隨手關掉。
+
+深度來源是節點內即時跑的 **Depth-Anything-V2 (vitl)**，**不是 ZED 的 `depth_registered`**：
+
+| | 訓練/推論用的 | ZED 相機的 |
+|---|---|---|
+| 內容 | 相對**逆**深度（disparity），**大值 = 近** | 公制深度，uint16，單位 mm |
+| 尺度 | 每幀自己一個尺度（實測連續幀間漂移約 2%） | 絕對公制 |
+
+兩者連大小方向都相反，把 ZED 深度餵進去會比餵零深度更糟。
+
+**管線**（每個 0.5 s 週期，接在既有的 `rgb_224` 之後）：
+
+```
+rgb_224 (224,224,3) uint8 ─→ /255（無 ImageNet 正規化）─→ DA-V2 vitl
+  ─→ relu 輸出 (224,224) ─→ fp16 往返 ─→ ring buffer ─→ batch['depth_224_seq'] (1,3,224,224)
+```
+
+這**逐位元重現**離線 `infer_depth_da_v2.py` 的 **batch 分支**（`model(x)`）。該腳本有兩條數值完全不同的路徑，走哪條取決於輸入尺寸：
+
+| 分支 | 觸發條件 | 前處理 |
+|---|---|---|
+| `model(x)`（**本節點用這條**） | 224×224（= 16×14，DINOv2 patch 整除） | 只有 `/255`，**沒有** ImageNet mean/std |
+| `model.infer_image(im)` | 尺寸不被 14 整除（如 720×1280）→ 例外後 fallback | resize 到 518 + ImageNet 正規化 |
+
+離線資料集是拿 224×224 的 crop 去產生的，所以是第一條。**不要**改用 `infer_image`。
+
+> ⚠️ **不要對深度做任何 normalize / rescale**：DA-V2 輸出實測落在 14~370，而模型端
+> `codex_pure_ASAP._depth()` 是 `clamp(0, 80) / 80` —— 約 **73% 的像素直接飽和成 1.0**。
+> 這看起來很浪費，但 checkpoint 就是在這個分布上訓練的，「把範圍用好」等於把輸入推離
+> 訓練分布，只會更糟。
+
+> ⚠️ **不要換成 vits/vitb**：整個輸出分布會位移，checkpoint 沒看過。
+
+**效能**（RTX 4070 SUPER 實測，224 輸入）：fp32 **17.8 ms**/幀、峰值顯存 1.4 GB。
+節點刻意用 fp32：autocast fp16 雖然快到 13.4 ms，但會多佔 700 MB（cast buffer），
+而 17.8 ms 只佔 0.5 s 週期的 3.6%，換不到值得的東西。
+
+**檔案位置**：套件在 `third_party/Depth-Anything-V2/`、權重在 `model/depth_anything_v2_vitl.pth`
+（1.3 GB）。兩者都可用 `~da_v2_repo` / `~da_v2_ckpt` 覆寫。
+
+> 這兩份是從 `/home/cyc/dataset/1222_obstacle/output_dataset/tools/Depth-Anything-V2/`
+> **複製**進來的，不是引用 —— `/home/cyc/dataset/` 底下的資料夾會消失（開發期間
+> `0504_what_up`、`0507_vlm`、`1208_school_stp3` 都不見過），預設路徑指過去會讓節點某天突然起不來。
+> `path_inference/` 整個在 `.gitignore` 裡，所以這 1.3 GB 不會進版控。
+
+**關掉會怎樣**：`_use_depth:=false` 時 batch 不放 `depth_224_seq`，
+`codex_pure_ASAP.forward` 會補一組**零深度**（fusion 層的深度通道是固定的、拿不掉）。
+節點啟動時會 `logwarn` 提醒這是訓練/推論不一致。實測同一幀開/關的預測差異可達 **0.62 m**。
+
+**載入失敗就報錯**：`~use_depth` 開著但套件或權重找不到時，節點直接 raise 起不來，
+不會靜默退回零深度 —— 「看起來正常在跑但其實餵零深度」比起不來難發現得多。
+
+### 固定速度輸入（`~fixed_speed`，預設關閉）
+
+模型在「車子有速度」時推論出的路徑比較符合預期，但靜止或慢速起步時，
+由真實 odom 擬合出的速度接近 0，軌跡會縮在原點附近。
+
+設 `_fixed_speed:=1.0` 後，餵給模型的 `admlp_input` 改用**合成的等速直線歷史**：
+過去 4 點固定為 `(0,-2,0) (0,-1.5,0) (0,-1,0) (0,-0.5,0)`（模型座標 `x_left, y_front, yaw`，
+0.5 s 節拍），速度固定為 `(0, 1.0, 0)`，加速度全 0。等於告訴模型「我正以 1 m/s 直行」。
+
+```bash
+python3 realtime/realtime_planner_node.py _fixed_speed:=1.0
+```
+
+> 只影響 `admlp_input` 這 15 維。`future_egomotion`（視覺時序分支）、發布的三個路徑
+> topic、以及推論可視化圖上的 input 軌跡**全部仍使用真實 odom**，
+> 所以圖上可以直接對照「模型以為的速度」與「實際走的路」。
+> 值 `<= 0` 視同關閉（負值會 warn 後當成 0）。
 
 ### 給 MPC 控制器的 `array_topic`
 
@@ -93,19 +167,38 @@ conda activate stp3_ros
 ### 推論可視化圖（`~save_plots`，預設開啟）
 
 **預設就會**每次推論存一張**離線同風格的 combo 圖**到
-`realtime/inference/<MM_DD_HH_MM_SS>/inference_plots/`，檔名 `{序號:06d}_{時間戳ns}.png`：
-左邊 224×224 相機影像、右邊軌跡面板（🟢 過去 input + 🔵 GT + 🔴 預測 + L2 數字），
-與 `inference/imgs/…/inference_plots` 的圖一致。不想存圖時：
+`realtime/inference/<MM_DD_HH_MM_SS>/inference_plots/`，檔名 `{序號:06d}_{時間戳ns}.png`。
+預設版面共五格，由左至右：
+
+| # | 面板 | 尺寸 | 內容 |
+|---|------|------|------|
+| 1 | 相機影像 | 224×224 | center-crop 後、真正餵進模型的那一格 RGB |
+| 2 | `SEG PALETTE4` | 224×224 | 語意分割上色，與 `/senpai/seg_cls4_224` 及 `bag_to_data.py` 產的離線資料集**同一組顏色**（路面紫、人紅、可動藍、靜物灰），可直接對照 |
+| 3 | `SEG model-input` | 224×224 | 同一張分割圖，但用 `SEG_PALETTE`（§8 那組刻意差一格的調色盤）上色，也就是**真正進到 checkpoint 的像素值**。路面在這格是**黑色**、靜物是綠色，這是正常的，不要去「修」 |
+| 4 | `DEPTH DA-V2` | 224×224 | Depth-Anything-V2 的相對逆深度，**亮 = 近**。每幀 min-max 拉伸（與離線 `--save_vis` 相同），這只是**顯示用**，餵給模型的仍是未正規化的原始值 |
+| 5 | 軌跡面板 | 512×512 | 🟢 過去 input + 🔵 GT + 🔴 預測 + L2 數字，與 `inference/imgs/…/inference_plots` 的圖一致 |
+
+第 2~4 格都對應第 1 格那張影像，所以「軌跡預測很怪」時可以一眼分辨是**分割壞了**、
+**深度壞了**還是**規劃壞了**。要減面板 / 不想存圖時：
 
 ```bash
-python3 realtime/realtime_planner_node.py _save_plots:=false
+python3 realtime/realtime_planner_node.py _save_plots:=false   # 完全不存圖
+python3 realtime/realtime_planner_node.py _plot_seg:=false     # 拿掉兩格分割面板
+python3 realtime/realtime_planner_node.py _plot_depth:=false   # 拿掉深度面板
 ```
+
+（`~use_depth:=false` 時第 4 格自動消失，不需要另外設 `~plot_depth`。）
 
 **GT 從何而來（圖會晚 3 秒落地）**：即時推論當下拿不到未來 GT，因此節點會把每次推論
 **排入佇列**，等後續 6 個 0.5s 取樣（= 3 s）到齊後，用機器人**實際走過的路徑**當 GT
 補畫並算 L2。所以圖比即時畫面**延遲約 3 秒**才出現，這是拿到真實 GT 的必要代價。
 GT 的座標算法與離線 loader 的 `get_gt_trajectory` 完全相同（`(x_left, y_front, yaw)`，
 開頭補 `(0,0,0)`），因此紅藍兩線可直接比對。
+
+> ⚠️ **GT 的時間跨度會略大於 3 s**：GT 取樣點沿用 `cb_image` 的節拍閘門（`>= ~sample_interval`），
+> 而相機幀率是離散的 —— 15 Hz 相機實測中位數落在 **0.533 s**（8 幀）而非 0.5 s，
+> 6 個點就是 3.2 s。GT 因此比模型的 3 s 預測視野**多走約 6.7%**，會系統性地略微放大
+> **縱向** L2。要精確評估請用離線 `park_L2_ASAP.py`（資料已重取樣到準確的 0.5 s）。
 
 > ⚠️ **L2 的意義要看有沒有閉環**：若 MPC 正在**追蹤本節點發出的路徑**（`array_topic` 那條鏈），
 > 機器人實際走的就會逼近預測本身，L2 會變成**自我實現的小數字**，不能當成離線那種
@@ -138,13 +231,17 @@ rostopic pub /senpai/command std_msgs/String "data: 'LEFT'" -r 1
 
 未收到任何指令時預設為 `FORWARD`。無法辨識的字串會被忽略並保留前一個指令。
 
-> ⚠️ **command 反向補償（`~flip_command`，預設 `true`）**：
-> 此 checkpoint 的 command 通道是**反的** —— 直接餵 `LEFT` 會讓路徑往**右**偏 2–3m，反之亦然。
-> （模型 `codex_pure_ASAP.py` 的 `dir_loss` 方向與 loader `:630` 的 `LEFT`/`RIGHT` 標籤相反；
-> 已用「同一場景只改 command」的受控 A/B 實驗證實。e）
-> 節點預設在送進模型前把 `LEFT`↔`RIGHT` 對調，讓 `/senpai/command` 的語意符合物理直覺（送 `LEFT` 真的向左）。
-> 若你想餵原始標籤（例如日後修好模型），設 `_flip_command:=false`。
-> `FORWARD` 不受影響。這是**模型層的既有 bug**，不是即時節點造成的。
+> ℹ️ **橫向符號**：模型輸出軌跡的第 0 通道是橫向、且**右為正**，與 loader `gt_trajectory`
+> 的 `x_left`（左為正）相反。節點在 `plan()` 統一翻一次符號（與離線的
+> `park_L2_ASAP.py:742` 相同），之後三個發布 topic 與存圖都直接沿用，不再各自處理。
+> 指令**原樣**送進模型，`/senpai/command` 的語意就是物理語意（送 `LEFT` 真的向左）。
+>
+> 舊版曾有 `~flip_command` 參數，在送進模型前把 `LEFT`↔`RIGHT` 對調，理由是
+> 「checkpoint 的 command 通道是反的」。那是誤判 —— 當時的 A/B 實驗看的是缺少上述符號
+> 翻轉的發布端，兩種解釋無法區分。用離線 `l2_errors.csv` 可判定模型沒有反：翻轉後
+> 177 個轉彎樣本（`|gt_x| >= 1`）符號**全部**一致、`corr(gt_x, pred_x) = 0.88`，
+> 不翻轉的話橫向誤差是 5.53 m。`dir_loss`（LEFT → `pred_last_x` 為負）在「右為正」
+> 慣例下與 loader 標籤一致。該參數已移除。
 
 ### 輸出格式
 
@@ -177,11 +274,31 @@ python3 realtime/keyboard_command.py
 # 終端 4：即時視窗（座標 + 已走軌跡 + 預測軌跡，見 §6）
 python3 realtime/visualize.py
 
-# 終端 5：實機相機，或用 bag 回放測試
-rosbag play dataset/0624bkgd/video1/2026-06-23-18-23-14.bag
+# 終端 5：實機相機，或用 bag 回放測試（注意 topic 名稱，見下方 ⚠️）
+rosbag play /home/cyc/campus_ws/mpcdata/bkgd_20260623/2026-06-23-18-23-14.bag \
+  /zed2i/zed_node/right_raw/image_raw_color:=/zed2i/zed_node/rgb_raw/image_raw_color
 ```
 
-首次啟動較慢：需下載 SegFormer 權重並建立 ST-P3 模型（約 1–3 分鐘）。
+> ⚠️ **bag 的影像 topic 可能不是 `rgb_raw`**：`bkgd_20260623` 這支 bag 錄的是
+> `/zed2i/zed_node/**right_raw**/image_raw_color`，而節點預設訂閱 `rgb_raw`。
+> **不做 remap 的話節點收不到任何影像、完全不會推論也不出圖，且不會報錯**（只會一直
+> `waiting for /odom` 之後就靜默）。先用 `rosbag info <bag>` 確認 topic 名稱，再用上面的
+> remap（或改用 `_in_topic:=...` 啟動節點）。
+
+首次啟動較慢：需下載 SegFormer 權重、載入 Depth-Anything-V2（1.3 GB）並建立 ST-P3 模型（約 1–3 分鐘）。
+
+啟動時 log 會印出深度狀態，可用來確認沒被誤關：
+
+```
+[planner] loading Depth-Anything-V2 /home/cyc/campus_ws/path_inference/model/depth_anything_v2_vitl.pth
+[planner] use_depth=true: Depth-Anything-V2 relative depth (vitl) -> depth_224_seq, as the checkpoint was trained
+```
+
+推論中的每行計時也會多一段 `depth=`：
+
+```
+[planner] seg=12.3 ms | depth=17.8 ms | plan=45.6 ms | total=75.7 ms | command=FORWARD
+```
 
 ### 檢查
 
@@ -216,7 +333,7 @@ python3 realtime/keyboard_command.py
 | `q` / `Ctrl-C` | 離開 |
 
 **鎖存式**：按一次某方向就維持該指令，直到你按下另一個方向。發布用 latch，所以較晚啟動的推論節點也會收到最後一個指令。
-（提醒：方向的物理意義已由 planner 的 `~flip_command` 補償，送 `←` 真的往左，見 §3。）
+（方向即物理方向，送 `←` 就是往左，指令原樣進模型，見 §3。）
 
 ---
 
@@ -279,9 +396,10 @@ rosbag play dataset/0624bkgd/video1/2026-06-23-18-23-14.bag   # 終端 3
 ### 暖機需要 5 個 pose，不是 3 個
 
 - 影像緩衝 **3 筆**（`TIME_RECEPTIVE_FIELD=3`）
+- 深度緩衝 **3 筆**（與影像同一節拍，`~use_depth` 開啟時才存在）
 - Pose 緩衝 **5 筆**（`ADMLP_PAST_FRAMES=4` + t0 = 2.5 秒）
 
-**pose 的歷史視野比影像長**，所以暖機以 pose 為準（約 2.5 秒）。兩者湊滿前不推論。
+**pose 的歷史視野比影像長**，所以暖機以 pose 為準（約 2.5 秒）。全部湊滿前不推論。
 
 ### ⚠️ 調色盤錯位是刻意保留的
 
@@ -306,7 +424,8 @@ rosbag play dataset/0624bkgd/video1/2026-06-23-18-23-14.bag   # 終端 3
   （`codex_pure_ASAP.py:756-770`）→ 即時推論傳零張量，預測不受影響。
 - **`future_egomotion[2]`**：離線版取自未來影格，但模型只讀 index 0、1
   （`codex_pure_ASAP.py:653-666`）→ 填零。
-- **深度**：全程停用，模型 forward 會自動補零深度。
+（**深度不在此列**：`~use_depth` 預設開啟，餵的是 Depth-Anything-V2 的相對深度，
+見 §3。只有把它關掉時，模型 forward 才會自動補零深度。）
 
 ### 呼叫順序
 

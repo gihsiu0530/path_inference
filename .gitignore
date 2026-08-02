@@ -1,6 +1,9 @@
 __pycache__/
 *.zip
 *.ckpt
+# Model weights, same reasoning as *.ckpt: model/depth_anything_v2_vitl.pth is
+# 1.3 GB and is fetched/copied, not authored here.
+*.pth
 *.png
 *.jpg
 *.npy

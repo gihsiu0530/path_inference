@@ -31,7 +31,7 @@ from std_msgs.msg import String
 
 
 KEY_TO_COMMAND = {
-    "\x1b[D": "LEFT",     "s": "LEFT",
+    "\x1b[D": "LEFT",     "a": "LEFT",
     "\x1b[A": "FORWARD",  "w": "FORWARD",  " ": "FORWARD",
     "\x1b[C": "RIGHT",    "d": "RIGHT",
 }
