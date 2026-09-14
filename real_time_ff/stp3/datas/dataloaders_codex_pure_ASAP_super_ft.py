@@ -1,0 +1,220 @@
+import numpy as np
+import torch
+import torch.utils.data
+from nuscenes.nuscenes import NuScenes
+from torch.utils.data import WeightedRandomSampler
+
+from stp3.datas.NuscenesData_ped_traj_change import FuturePredictionDataset
+from stp3.datas.NuscenesData_re_thinking import ADMLPFeatureDataset
+
+
+def _build_ped_presence_mask(dataset):
+    has_ped = np.zeros(len(dataset), dtype=np.bool_)
+    for i in range(len(dataset)):
+        keyframe_name = dataset._get_present_keyframe_name(i)
+        has_ped[i] = bool(dataset.ped_pred_index.get(keyframe_name))
+    return has_ped
+
+
+def _compute_min_dist_per_t(gt_xy: torch.Tensor, ped_xy: torch.Tensor, ped_valid: torch.Tensor):
+    if ped_xy.numel() == 0 or not ped_valid.any():
+        return None, None
+    t = gt_xy.shape[0]
+    ped_xy = ped_xy[:, :t]
+    ped_valid = ped_valid[:, :t]
+    if not ped_valid.any():
+        return None, None
+    dist = torch.norm(gt_xy.unsqueeze(0) - ped_xy, dim=-1)
+    inf = torch.full_like(dist, float('inf'))
+    dist_valid = torch.where(ped_valid, dist, inf)
+    min_dist_t = dist_valid.amin(dim=0)
+    has_valid_t = ped_valid.any(dim=0)
+    return min_dist_t, has_valid_t
+
+
+def _build_triggered_mask(dataset, safe_dist):
+    triggered = np.zeros(len(dataset), dtype=np.bool_)
+    for i in range(len(dataset)):
+        ref_index = dataset.indices[i][dataset.receptive_field - 1]
+        rec = dataset.ixes[ref_index]
+        gt_traj_np, _ = dataset.get_gt_trajectory(rec, ref_index)
+        gt_xy = torch.from_numpy(gt_traj_np[1:, :2]).float()
+
+        keyframe_name = dataset._get_present_keyframe_name(i)
+        persons = dataset.ped_pred_index.get(keyframe_name, [])[:dataset.ped_max_agents]
+        if not persons:
+            continue
+
+        ped_xy, ped_valid = dataset._build_ped_bev_points(rec, persons)
+        ped_xy = ped_xy.float()
+        ped_valid = ped_valid.bool()
+        min_dist_t, has_valid_t = _compute_min_dist_per_t(gt_xy, ped_xy, ped_valid)
+        if min_dist_t is None:
+            continue
+        if bool(((min_dist_t < float(safe_dist)) & has_valid_t).any().item()):
+            triggered[i] = True
+    return triggered
+
+
+def _build_ped_heavy_weights(has_ped, target_ratio):
+    has_ped = has_ped.astype(np.bool_)
+    n_total = len(has_ped)
+    n_ped = int(has_ped.sum())
+    n_nonped = int(n_total - n_ped)
+    if n_ped == 0 or n_nonped == 0:
+        return np.ones(n_total, dtype=np.float32)
+    target_ratio = float(np.clip(target_ratio, 1e-3, 1.0 - 1e-3))
+    w_ped = target_ratio / n_ped
+    w_nonped = (1.0 - target_ratio) / n_nonped
+    weights = np.where(has_ped, w_ped, w_nonped).astype(np.float32)
+    weights /= weights.mean()
+    return weights
+
+
+def _build_three_way_weights(triggered, has_ped_only, normal, target_ratios):
+    masks = [
+        triggered.astype(np.bool_),
+        has_ped_only.astype(np.bool_),
+        normal.astype(np.bool_),
+    ]
+    targets = np.asarray(target_ratios, dtype=np.float32)
+    targets = np.clip(targets, 0.0, None)
+    present = np.asarray([mask.any() for mask in masks], dtype=np.bool_)
+    if not present.any():
+        return np.ones(len(triggered), dtype=np.float32), targets
+
+    targets = np.where(present, targets, 0.0)
+    if targets.sum() <= 0:
+        targets = present.astype(np.float32)
+    targets = targets / targets.sum()
+
+    weights = np.zeros(len(triggered), dtype=np.float32)
+    for mask, target in zip(masks, targets):
+        n = int(mask.sum())
+        if n > 0 and target > 0:
+            weights[mask] = float(target) / n
+    if weights.sum() <= 0:
+        return np.ones(len(triggered), dtype=np.float32), targets
+    weights /= weights.mean()
+    return weights.astype(np.float32), targets
+
+
+def prepare_dataloaders_codex_pure_ASAP_super_ft(cfg, return_dataset=False):
+    if cfg.DATASET.NAME != 'nuscenes':
+        raise NotImplementedError('codex_pure_super_ft currently only supports nuscenes')
+
+    dataroot = cfg.DATASET.DATAROOT
+    nusc = NuScenes(version='v1.0-{}'.format(cfg.DATASET.VERSION), dataroot=dataroot, verbose=False)
+    traindata = FuturePredictionDataset(nusc, 0, cfg)
+    valdata = FuturePredictionDataset(nusc, 1, cfg)
+
+    nworkers = cfg.N_WORKERS
+    ped_target_ratio = float(getattr(cfg, 'PED_FINETUNE_TARGET_RATIO', 0.4))
+    ped_sampling_mode = str(getattr(cfg, 'PED_FINETUNE_SAMPLING', 'triggered'))
+    ped_safe_dist = float(getattr(cfg, 'PED_FINETUNE_SAFE_DIST', getattr(cfg, 'LOSS_PED_REPULSE_SAFE_DIST', 6.0)))
+    triggered_target_ratio = float(getattr(cfg, 'PED_FINETUNE_TRIGGERED_RATIO', 0.3))
+    has_ped_target_ratio = float(getattr(cfg, 'PED_FINETUNE_HAS_PED_RATIO', 0.3))
+    normal_target_ratio = float(getattr(cfg, 'PED_FINETUNE_NORMAL_RATIO', 0.4))
+
+    has_ped = _build_ped_presence_mask(traindata)
+    triggered = _build_triggered_mask(traindata, ped_safe_dist)
+    has_ped_only = has_ped & ~triggered
+    normal = ~has_ped
+    n_total = len(has_ped)
+
+    if ped_sampling_mode == 'three_way':
+        weights, actual_targets = _build_three_way_weights(
+            triggered,
+            has_ped_only,
+            normal,
+            [triggered_target_ratio, has_ped_target_ratio, normal_target_ratio],
+        )
+    else:
+        positives = triggered if ped_sampling_mode == 'triggered' else has_ped
+        if not positives.any():
+            print(f'[CODEX_SUPER_FT] no positive samples found for mode={ped_sampling_mode}; fallback to has_ped')
+            positives = has_ped
+            ped_sampling_mode = 'has_ped'
+        weights = _build_ped_heavy_weights(positives, ped_target_ratio)
+
+    sampler = WeightedRandomSampler(
+        weights=torch.from_numpy(weights),
+        num_samples=len(weights),
+        replacement=True,
+    )
+
+    print(
+        f'[CODEX_SUPER_FT] train total={n_total}, has_ped={int(has_ped.sum())} ({has_ped.mean():.2%}), '
+        f'triggered={int(triggered.sum())} ({triggered.mean():.2%})'
+    )
+    if ped_sampling_mode == 'three_way':
+        n_triggered = int(triggered.sum())
+        n_has_ped_only = int(has_ped_only.sum())
+        n_normal = int(normal.sum())
+        print(
+            f'[CODEX_SUPER_FT] sampler mode=three_way '
+            f'triggered={n_triggered} ({n_triggered / max(1, n_total):.2%}), '
+            f'has_ped_only={n_has_ped_only} ({n_has_ped_only / max(1, n_total):.2%}), '
+            f'normal={n_normal} ({n_normal / max(1, n_total):.2%})'
+        )
+        print(
+            f'[CODEX_SUPER_FT] target sampling ratios: '
+            f'triggered={actual_targets[0]:.2%}, has_ped_only={actual_targets[1]:.2%}, '
+            f'normal={actual_targets[2]:.2%}'
+        )
+        print(
+            f'[CODEX_SUPER_FT] sampler weights: '
+            f'triggered={weights[triggered][0] if n_triggered > 0 else 0:.6f}, '
+            f'has_ped_only={weights[has_ped_only][0] if n_has_ped_only > 0 else 0:.6f}, '
+            f'normal={weights[normal][0] if n_normal > 0 else 0:.6f}'
+        )
+    else:
+        positives = triggered if ped_sampling_mode == 'triggered' else has_ped
+        n_pos = int(positives.sum())
+        n_neg = int(n_total - n_pos)
+        print(
+            f'[CODEX_SUPER_FT] sampler positives(mode={ped_sampling_mode})={n_pos} ({n_pos / max(1, n_total):.2%}), '
+            f'negatives={n_neg}'
+        )
+        print(f'[CODEX_SUPER_FT] target ped sampling ratio={ped_target_ratio:.2%}')
+        print(
+            f'[CODEX_SUPER_FT] sampler weights: positive={weights[positives][0] if n_pos > 0 else 0:.6f}, '
+            f'negative={weights[~positives][0] if n_neg > 0 else 0:.6f}'
+        )
+    print(f'[CODEX_SUPER_FT] ped trigger safe dist={ped_safe_dist:.2f} m')
+
+    train_base = traindata
+    val_base = valdata
+    traindata = ADMLPFeatureDataset(traindata, "train", cfg)
+    valdata = ADMLPFeatureDataset(valdata, "val", cfg)
+
+    trainloader = torch.utils.data.DataLoader(
+        traindata,
+        batch_size=cfg.BATCHSIZE,
+        sampler=sampler,
+        shuffle=False,
+        num_workers=nworkers,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2,
+        drop_last=True,
+    )
+
+    valloader = torch.utils.data.DataLoader(
+        valdata,
+        batch_size=cfg.BATCHSIZE,
+        shuffle=False,
+        num_workers=nworkers,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2,
+        drop_last=False,
+    )
+
+    if return_dataset:
+        return trainloader, valloader, train_base, val_base
+    return trainloader, valloader
+
+
+# Backward-compatible alias for scripts that import the generic name.
+prepare_dataloaders_codex_pure_super_ft = prepare_dataloaders_codex_pure_ASAP_super_ft

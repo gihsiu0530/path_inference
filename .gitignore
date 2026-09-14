@@ -16,3 +16,15 @@ __pycache__/
 dataset/**
 !dataset/**/
 !dataset/**/*.py
+
+# real_time_ff: track code only. Weights, third-party model repos, local
+# workspace copies, experiment scratch and plot output stay out of git.
+real_time_ff/model/
+real_time_ff/TwinLiteNet/
+real_time_ff/time/
+real_time_ff/move/
+real_time_ff/imgs/
+real_time_ff/record/
+real_time_ff/漸進修正/
+real_time_ff/**/*copy*
+real_time_ff/**/*(copy)*
