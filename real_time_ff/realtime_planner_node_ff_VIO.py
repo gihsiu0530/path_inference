@@ -120,6 +120,40 @@ def prepend_back_point(points: np.ndarray, times: np.ndarray, back_m: float):
     back[0, 2:] = points[0, 2:]
     return np.vstack([back, points]), np.concatenate([[time_back], times])
 
+
+ROAD_CLASS_ID = 0
+
+
+def road_mask_difference(prev_seg: np.ndarray, curr_seg: np.ndarray) -> float:
+    """1 - IoU of the road class between two cls4 maps; 0 when neither has any road."""
+    prev_road = prev_seg == ROAD_CLASS_ID
+    curr_road = curr_seg == ROAD_CLASS_ID
+    union = int(np.count_nonzero(prev_road | curr_road))
+    if union == 0:
+        return 0.0
+    return 1.0 - int(np.count_nonzero(prev_road & curr_road)) / union
+
+
+def gate_segmentation(prev_used, curr, hold_count: int, max_diff: float, max_hold: int):
+    """
+    Temporal guard against a segmentation that suddenly goes wrong.
+
+    A broken mask feeds the model directly and makes the predicted path diverge.
+    If the road region of `curr` differs from the previously *used* mask by
+    max_diff or more (1 - IoU), keep using `prev_used`. At most max_hold frames
+    in a row are held, so a genuine scene change is accepted afterwards instead
+    of freezing on a stale mask.
+
+    Returns (used, hold_count, diff, held).
+    """
+    if prev_used is None or max_diff >= 1.0:
+        return curr, 0, 0.0, False
+    diff = road_mask_difference(prev_used, curr)
+    if diff >= max_diff and hold_count < max_hold:
+        return prev_used, hold_count + 1, diff, True
+    return curr, 0, diff, False
+
+
 # YOLO26 semantic checkpoints without a dataset suffix use the standard 19
 # Cityscapes train IDs. Convert their dense class map to the four classes the FF
 # checkpoint was trained with: 0=road, 1=person, 2=movable, 3=static.
@@ -329,6 +363,18 @@ class RealtimePlannerNodeFF(legacy.RealtimePlannerNode):
                 "~path_back_extension_m", self.path_point_spacing_m
             )
         )
+        # Segmentation temporal guard, see gate_segmentation. max_diff is the
+        # road 1 - IoU against the previously used mask (>= 1 disables);
+        # max_hold is how many frames in a row may reuse the previous mask.
+        self.seg_gate_max_diff = float(legacy.rospy.get_param("~seg_gate_max_diff", 0.85))
+        self.seg_gate_max_hold = int(legacy.rospy.get_param("~seg_gate_max_hold", 3))
+        if self.seg_gate_max_diff <= 0.0 or self.seg_gate_max_hold < 0:
+            raise ValueError("~seg_gate_max_diff must be > 0 and ~seg_gate_max_hold >= 0")
+        self._seg_gate_prev = None
+        self._seg_gate_hold = 0
+        # The buffer the gate state belongs to; the legacy node replaces the
+        # buffer on a clock restart, which must also drop the gate history.
+        self._seg_gate_buffer = None
         # (source trajectory, points, times) for the current cycle. The three
         # builders are called once each per cycle on the same trajectory, and
         # the smoothing must not run three times.
@@ -430,6 +476,12 @@ class RealtimePlannerNodeFF(legacy.RealtimePlannerNode):
                 "[FF planner] path smoothing off: publishing the raw "
                 f"{legacy.N_FUTURE_FRAMES + 1} time-spaced points"
             )
+        if self.seg_gate_max_diff < 1.0:
+            legacy.rospy.loginfo(
+                f"[FF planner] segmentation gate on: reuse the previous mask when road "
+                f"1-IoU >= {self.seg_gate_max_diff:.2f}, at most "
+                f"{self.seg_gate_max_hold} frames in a row"
+            )
         if self.path_back_extension_m > 0.0:
             legacy.rospy.loginfo(
                 f"[FF planner] path back extension on: one point "
@@ -522,6 +574,39 @@ class RealtimePlannerNodeFF(legacy.RealtimePlannerNode):
 
     @torch.inference_mode()
     def segment(self, rgb: np.ndarray) -> np.ndarray:
+        """
+        The mask actually used for this frame: the backend's (224,224) class IDs,
+        or the previous mask when the segmentation gate rejects this one. The
+        model input, /senpai/seg_cls4_224 and the plots all take this result.
+        """
+        raw = self._segment_raw(rgb)
+        if self.buffer is not self._seg_gate_buffer:
+            self._seg_gate_prev = None
+            self._seg_gate_hold = 0
+            self._seg_gate_buffer = self.buffer
+        prev_hold = self._seg_gate_hold
+        used, self._seg_gate_hold, diff, held = gate_segmentation(
+            self._seg_gate_prev,
+            raw,
+            self._seg_gate_hold,
+            self.seg_gate_max_diff,
+            self.seg_gate_max_hold,
+        )
+        if held:
+            legacy.rospy.logwarn_throttle(
+                1.0,
+                f"[FF planner] segmentation gate: holding previous mask "
+                f"(road 1-IoU={diff:.2f}, {self._seg_gate_hold}/{self.seg_gate_max_hold} in a row)",
+            )
+        elif prev_hold >= self.seg_gate_max_hold > 0 and diff >= self.seg_gate_max_diff:
+            legacy.rospy.logwarn(
+                f"[FF planner] segmentation gate: hold limit reached, accepting the "
+                f"current mask (road 1-IoU={diff:.2f})"
+            )
+        self._seg_gate_prev = used
+        return used
+
+    def _segment_raw(self, rgb: np.ndarray) -> np.ndarray:
         """Return either backend as identical (224,224) PALETTE4 class IDs."""
         if self.segmentation_backend == "segformer":
             # This inherited call is intentionally unchanged: old preprocessing,
