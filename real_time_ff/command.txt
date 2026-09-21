@@ -1,0 +1,47 @@
+
+
+1.
+python realtime_planner_node_ff.py     _checkpoint:=/home/cyc/campus_ws/path_inference/real_time_ff/model/0804_admlp/last.ckpt     _expected_model_variant:=all_admlp     _ego_input_mode:=real_odom     _use_depth:=true     _use_fp16:=true     _save_plots:=true     _plot_seg:=true     _plot_depth:=true
+
+
+2.python realtime_planner_node_ff.py     _checkpoint:=/home/cyc/campus_ws/path_inference/real_time_ff/model/0804_admlp/best-l2-epoch=28-epoch_val_plan_L2=0.5243.ckpt   _expected_model_variant:=all_admlp     _ego_input_mode:=real_odom     _use_depth:=true     _use_fp16:=true     _save_plots:=true     _plot_seg:=true     _plot_depth:=true
+
+
+3.  
+python realtime_planner_node_ff.py     _checkpoint:=/home/cyc/campus_ws/path_inference/real_time_ff/model/0804_admlp/best-l2-epoch=28-epoch_val_plan_L2=0.5243.ckpt   _expected_model_variant:=all_admlp     _ego_input_mode:=fixed_speed     _fixed_speed_mps:=1.0     _use_depth:=true     _use_fp16:=true     _save_plots:=true     _plot_seg:=true     _plot_depth:=true
+
+
+
+4.little good  曲率
+python realtime_planner_node_ff.py     _checkpoint:=/home/cyc/campus_ws/path_inference/real_time_ff/model/0804_admlp/last.ckpt   _expected_model_variant:=all_admlp     _ego_input_mode:=fixed_speed     _fixed_speed_mps:=1.0     _use_depth:=true     _use_fp16:=true     _save_plots:=true     _plot_seg:=true     _plot_depth:=true
+
+
+5. 曲率
+python realtime_planner_node_ff.py     _checkpoint:=/home/cyc/campus_ws/path_inference/real_time_ff/model/0805_hybrid/last.ckpt     _expected_model_variant:=hybrid     _ego_input_mode:=fixed_speed     _fixed_speed_mps:=1.0     _use_depth:=true     _use_fp16:=true     _save_plots:=true     _plot_seg:=true     _plot_depth:=true _plot_mode:=realtime
+
+
+
+6.曲率，目前還行
+python realtime_planner_node_ff.py     _checkpoint:=/home/cyc/campus_ws/path_inference/real_time_ff/model/0805_hybrid/best-l2-epoch=28-epoch_val_plan_L2=1.2814.ckpt     _expected_model_variant:=hybrid     _ego_input_mode:=fixed_speed     _fixed_speed_mps:=1.0     _use_depth:=true     _use_fp16:=true     _save_plots:=true     _plot_seg:=true     _plot_depth:=true _plot_mode:=realtime
+
+
+7.
+python realtime_planner_node_ff_VIO.py _checkpoint:=/home/cyc/campus_ws/path_inference/real_time_ff/model/0805_hybrid/best-l2-epoch=28-epoch_val_plan_L2=1.2814.ckpt     _expected_model_variant:=hybrid     _ego_input_mode:=real_odom     _use_depth:=true     _use_fp16:=true     _save_plots:=true     _plot_seg:=true     _plot_depth:=true _plot_mode:=realtime
+
+
+8.
+python realtime_planner_node_ff_VIO_VLM.py _checkpoint:=/home/cyc/campus_ws/path_inference/real_time_ff/model/0805_hybrid/best-l2-epoch=28-epoch_val_plan_L2=1.2814.ckpt     _expected_model_variant:=hybrid     _ego_input_mode:=fixed_speed     _fixed_speed_mps:=1.0     _use_depth:=true     _use_fp16:=true     _save_plots:=true     _plot_seg:=true     _plot_depth:=true _plot_mode:=realtime
+
+
+
+9. TwinLiteNet 可行駛區域取代語義分割 this!!!
+python realtime_planner_node_ff.py _checkpoint:=/home/cyc/campus_ws/path_inference/real_time_ff/model/0805_hybrid/best-l2-epoch=28-epoch_val_plan_L2=1.2814.ckpt     _expected_model_variant:=hybrid     _ego_input_mode:=fixed_speed     _fixed_speed_mps:=1.0     _segmentation_backend:=yolo26l     _use_depth:=true     _use_fp16:=true     _save_plots:=true     _plot_seg:=true     _plot_depth:=true _plot_mode:=realtime
+
+python realtime_planner_node_ff.py _checkpoint:=/home/cyc/campus_ws/path_inference/real_time_ff/model/0805_hybrid/best-l2-epoch=28-epoch_val_plan_L2=1.2814.ckpt     _expected_model_variant:=hybrid     _ego_input_mode:=fixed_speed     _fixed_speed_mps:=1.0     _segmentation_backend:=twinlitenet     _use_depth:=true     _use_fp16:=true     _save_plots:=true     _plot_seg:=true     _plot_depth:=true _plot_mode:=realtime
+
+python realtime_planner_node_ff_VIO.py _checkpoint:=/home/cyc/campus_ws/path_inference/real_time_ff/model/0805_hybrid/best-l2-epoch=28-epoch_val_plan_L2=1.2814.ckpt     _expected_model_variant:=hybrid     _ego_input_mode:=fixed_speed     _fixed_speed_mps:=1.0     _segmentation_backend:=yolo26l     _use_depth:=true     _use_fp16:=true     _save_plots:=true     _plot_seg:=true     _plot_depth:=true _plot_mode:=realtime
+
+10. 離線 bag 測試（不需要 roscore / rosbag play）
+   環境要用 stp3_ros，不是系統 python：
+/home/cyc/anaconda3/envs/stp3_ros/bin/python offline_bag_runner_ff.py --bag /home/cyc/campus_ws/mpcdata/bkgd0623/2026-06-23-18-23-14.bag     _checkpoint:=/home/cyc/campus_ws/path_inference/real_time_ff/model/0805_hybrid/best-l2-epoch=28-epoch_val_plan_L2=1.2814.ckpt     _expected_model_variant:=hybrid     _ego_input_mode:=fixed_speed     _fixed_speed_mps:=1.0     _segmentation_backend:=twinlitenet     _in_topic:=/zed2i/zed_node/right_raw/image_raw_color     _use_depth:=true     _use_fp16:=true     _plot_mode:=realtime
+   把 _segmentation_backend 換成 segformer 就是對照組，取樣幀完全相同可直接比對。

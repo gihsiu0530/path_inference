@@ -1,0 +1,65 @@
+# Additive FF experiment.  stp3/config_ff.py loads the original config first.
+BASE_CONFIG: "stp3/configs/nuscenes/vlm.yml"
+
+TAG: "Planning_ASAP_ff"
+
+# FF always uses ego state and makes the frozen AD-MLP path an explicit input.
+RESIDUAL_CONTEXT_DROP_EGO: False
+FAST_DISABLE_RESIDUAL_GATE: False
+LOSS_GATE_TARGET_W: 0.0
+
+# The old unrestricted XY residual objectives are incompatible with a bounded
+# normal-only Frenet correction.  FF-specific losses below replace them.
+LOSS_RESIDUAL_AUX_W: 0.0
+LOSS_EASY_RESIDUAL_REG_W: 0.0
+LOSS_ENDPOINT_AUX_W: 0.0
+LOSS_SMO_W: 0.1
+
+# Camera-to-BEV projection.  Current saved depths have inverse-relative values
+# (observed roughly 0..610), not meters.  Switch to "metric" when the online
+# and training depth inputs are genuine camera-z meters.
+FF_DEPTH_MODE: "relative_inverse"
+FF_DEPTH_MIN_M: 1.0
+FF_DEPTH_MAX_M: 60.0
+FF_BEV_PROJECT_STRIDE: 2
+FF_BEV_RESOLUTION_M: 0.5
+FF_BEV_FORWARD_MIN_M: -10.0
+FF_BEV_FORWARD_MAX_M: 50.0
+FF_BEV_SIDE_MIN_M: -25.0
+FF_BEV_SIDE_MAX_M: 25.0
+FF_BEV_CHANNELS: 64
+FF_BEV_PATCH_RADIUS_M: 1.0
+FF_ROAD_SPLAT_RADIUS_M: 0.75
+
+# Bounded coarse-normal residual and confidence.
+FF_MAX_LATERAL_M: 2.0
+FF_ALPHA_INIT: 0.10
+FF_ALPHA_TARGET_DEADZONE_M: 0.15
+FF_ALPHA_TARGET_TEMPERATURE_M: 0.08
+FF_ROUTE_HEADS: 8
+
+# Force the network to use the coarse path instead of memorising one frozen
+# AD-MLP distribution.  A quarter of examples remain unperturbed identity data.
+FF_COARSE_AUG_ENABLED: True
+FF_COARSE_AUG_PROB: 0.75
+FF_COARSE_AUG_LATERAL_M: 1.0
+FF_COARSE_AUG_YAW_DEG: 5.0
+FF_COARSE_AUG_SPEED_RATIO: 0.15
+FF_COARSE_AUG_POINT_M: 0.20
+
+# FF supervision and footprint safety.
+LOSS_FF_LATERAL_W: 2.0
+LOSS_FF_ALPHA_W: 0.25
+LOSS_FF_IDENTITY_W: 0.5
+LOSS_FF_OFFROAD_W: 8.0
+LOSS_FF_IMPROVE_W: 4.0
+LOSS_FF_ROUTE_W: 0.2
+LOSS_FF_CORRIDOR_W: 2.0
+FF_GT_CORRIDOR_RADIUS_M: 1.0
+
+# No-HD-map safety: image-projected road evidence and conservative fallback.
+FF_UNKNOWN_POINT_COST: 0.15
+FF_SAFETY_MIN_COVERAGE: 0.35
+FF_UNKNOWN_RESIDUAL_PENALTY: 0.10
+FF_SAFETY_MARGIN_M: 0.35
+FF_SAFETY_FILTER_ENABLED: True
